@@ -437,6 +437,19 @@ fun ShareAddScreen(
         )
     }
 
+    LaunchedEffect(Unit) {
+        val migration = migratePlacesImagesToPrivateStorage(context, places)
+        if (migration.changed) {
+            places = migration.places
+            savePlaces(context, migration.places)
+            message = if (arabic) {
+                "تم تأمين صور الأماكن داخل ShareAdd"
+            } else {
+                "Place images secured inside ShareAdd"
+            }
+        }
+    }
+
     var showAddDialog by remember { mutableStateOf(false) }
     var editingIndex by remember { mutableStateOf<Int?>(null) }
     var showCategoryManager by remember { mutableStateOf(false) }
@@ -3994,6 +4007,94 @@ fun copyImageToPrivateStorage(context: Context, uri: Uri): String? {
     } catch (_: Exception) {
         null
     }
+}
+
+data class ImageMigrationResult(
+    val places: List<Place>,
+    val changed: Boolean
+)
+
+fun isShareAddPrivateImage(context: Context, imageRef: String): Boolean {
+    return try {
+        val file = File(imageRef)
+        file.isAbsolute && file.exists() && file.canonicalPath.startsWith(getShareAddImagesDir(context).canonicalPath)
+    } catch (_: Exception) {
+        false
+    }
+}
+
+fun copyFileImageToPrivateStorage(context: Context, sourceFile: File): String? {
+    return try {
+        if (!sourceFile.exists()) return null
+
+        val extension = sourceFile.extension.ifBlank { "jpg" }.lowercase()
+        val safeExtension = when (extension) {
+            "png", "webp", "jpg", "jpeg" -> extension
+            else -> "jpg"
+        }
+
+        val imageFile = File(
+            getShareAddImagesDir(context),
+            "shareadd_migrated_${System.currentTimeMillis()}_${UUID.randomUUID()}.$safeExtension"
+        )
+
+        sourceFile.inputStream().use { input ->
+            imageFile.outputStream().use { output ->
+                input.copyTo(output)
+            }
+        }
+
+        imageFile.absolutePath
+    } catch (_: Exception) {
+        null
+    }
+}
+
+fun migrateImageRefToPrivateStorage(context: Context, imageRef: String): String? {
+    if (imageRef.isBlank()) return null
+
+    if (isShareAddPrivateImage(context, imageRef)) {
+        return imageRef
+    }
+
+    return try {
+        val file = File(imageRef)
+        if (file.isAbsolute) {
+            copyFileImageToPrivateStorage(context, file)
+        } else {
+            copyImageToPrivateStorage(context, Uri.parse(imageRef))
+        }
+    } catch (_: Exception) {
+        null
+    }
+}
+
+fun migratePlacesImagesToPrivateStorage(context: Context, places: List<Place>): ImageMigrationResult {
+    var changed = false
+
+    val migratedPlaces = places.map { place ->
+        val migratedImages = place.images.mapNotNull { imageRef ->
+            val migrated = migrateImageRefToPrivateStorage(context, imageRef)
+
+            if (migrated != imageRef) {
+                changed = true
+            }
+
+            migrated
+        }
+
+        if (migratedImages.size != place.images.size) {
+            changed = true
+        }
+
+        if (migratedImages != place.images) {
+            place.copy(images = migratedImages, updatedAt = System.currentTimeMillis())
+        } else {
+            place
+        }
+    }
+
+    return ImageMigrationResult(migratedPlaces, changed)
 }
 
 fun saveBase64ImageToPrivateStorage(context: Context, base64: String): String? {
