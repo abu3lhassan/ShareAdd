@@ -52,11 +52,14 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.fragment.app.FragmentActivity
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
+import java.io.File
+import java.util.UUID
 
 data class Category(
     val ar: String,
@@ -492,19 +495,18 @@ fun ShareAddScreen(
     val imagePicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments()
     ) { uris ->
-        val picked = uris.take(5)
-
-        picked.forEach { uri ->
-            try {
-                context.contentResolver.takePersistableUriPermission(
-                    uri,
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION
-                )
-            } catch (_: Exception) {
-            }
+        val copiedImages = uris.take(5).mapNotNull { uri ->
+            copyImageToPrivateStorage(context, uri)
         }
 
-        images = picked.map { it.toString() }
+        images = copiedImages
+        message = if (copiedImages.isNotEmpty()) {
+            if (arabic) "تم حفظ الصور داخل ShareAdd بشكل خاص" else "Images saved privately inside ShareAdd"
+        } else if (uris.isNotEmpty()) {
+            if (arabic) "تعذر إضافة الصور" else "Could not add images"
+        } else {
+            message
+        }
     }
 
     val exportLauncher = rememberLauncherForActivityResult(
@@ -3173,22 +3175,31 @@ fun sharePlace(
 
     if (includeImages && place.images.isNotEmpty()) {
         val uriList = ArrayList<Uri>()
-        place.images.forEach { uriList.add(Uri.parse(it)) }
+        place.images.mapNotNull { shareAddImageUri(context, it) }.forEach { uriList.add(it) }
 
-        val intent = Intent(Intent.ACTION_SEND_MULTIPLE)
-        intent.type = "image/*"
-        intent.putParcelableArrayListExtra(Intent.EXTRA_STREAM, uriList as ArrayList<out Parcelable>)
-        intent.putExtra(Intent.EXTRA_TEXT, text)
-        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        if (uriList.isNotEmpty()) {
+            val intent = Intent(Intent.ACTION_SEND_MULTIPLE)
+            intent.type = "image/*"
+            intent.putParcelableArrayListExtra(Intent.EXTRA_STREAM, uriList as ArrayList<out Parcelable>)
+            intent.putExtra(Intent.EXTRA_TEXT, text)
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
 
-        context.startActivity(Intent.createChooser(intent, if (arabic) "مشاركة عبر" else "Share With"))
-    } else {
-        val intent = Intent(Intent.ACTION_SEND)
-        intent.type = "text/plain"
-        intent.putExtra(Intent.EXTRA_TEXT, text)
+            context.startActivity(Intent.createChooser(intent, if (arabic) "مشاركة عبر" else "Share With"))
+            return
+        }
 
-        context.startActivity(Intent.createChooser(intent, if (arabic) "مشاركة عبر" else "Share With"))
+        Toast.makeText(
+            context,
+            if (arabic) "تعذر العثور على الصور، تمت مشاركة النص فقط" else "Images were not available, shared text only",
+            Toast.LENGTH_SHORT
+        ).show()
     }
+
+    val intent = Intent(Intent.ACTION_SEND)
+    intent.type = "text/plain"
+    intent.putExtra(Intent.EXTRA_TEXT, text)
+
+    context.startActivity(Intent.createChooser(intent, if (arabic) "مشاركة عبر" else "Share With"))
 }
 
 @Composable
@@ -3868,7 +3879,7 @@ fun placesToJsonWithImages(context: Context, places: List<Place>): String {
             imageObj.put("uri", uriText)
 
             try {
-                val bytes = context.contentResolver.openInputStream(Uri.parse(uriText))?.use {
+                val bytes = openShareAddImageInputStream(context, uriText)?.use {
                     it.readBytes()
                 }
 
@@ -3907,9 +3918,9 @@ fun jsonToPlacesWithImages(context: Context, text: String): List<Place> {
                     val oldUri = item.optString("uri", "")
 
                     if (base64.isNotBlank()) {
-                        val uri = saveBase64ImageToGallery(context, base64)
-                        if (uri != null) {
-                            images.add(uri.toString())
+                        val savedImage = saveBase64ImageToPrivateStorage(context, base64)
+                        if (savedImage != null) {
+                            images.add(savedImage)
                         }
                     } else if (oldUri.isNotBlank()) {
                         images.add(oldUri)
@@ -3955,26 +3966,79 @@ fun jsonToPlacesWithImages(context: Context, text: String): List<Place> {
     return result
 }
 
-fun saveBase64ImageToGallery(context: Context, base64: String): Uri? {
-    return try {
-        val bytes = Base64.decode(base64, Base64.DEFAULT)
+fun getShareAddImagesDir(context: Context): File {
+    return File(context.filesDir, "shareadd_images").apply { mkdirs() }
+}
 
-        val values = ContentValues().apply {
-            put(MediaStore.Images.Media.DISPLAY_NAME, "shareadd_${System.currentTimeMillis()}.jpg")
-            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-            put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/ShareAdd")
+fun copyImageToPrivateStorage(context: Context, uri: Uri): String? {
+    return try {
+        val mimeType = context.contentResolver.getType(uri).orEmpty()
+        val extension = when {
+            mimeType.contains("png") -> "png"
+            mimeType.contains("webp") -> "webp"
+            else -> "jpg"
         }
 
-        val uri = context.contentResolver.insert(
-            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-            values
-        ) ?: return null
+        val imageFile = File(
+            getShareAddImagesDir(context),
+            "shareadd_${System.currentTimeMillis()}_${UUID.randomUUID()}.$extension"
+        )
 
-        context.contentResolver.openOutputStream(uri)?.use {
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            imageFile.outputStream().use { output ->
+                input.copyTo(output)
+            }
+        } ?: return null
+
+        imageFile.absolutePath
+    } catch (_: Exception) {
+        null
+    }
+}
+
+fun saveBase64ImageToPrivateStorage(context: Context, base64: String): String? {
+    return try {
+        val bytes = Base64.decode(base64, Base64.DEFAULT)
+        val imageFile = File(
+            getShareAddImagesDir(context),
+            "shareadd_restore_${System.currentTimeMillis()}_${UUID.randomUUID()}.jpg"
+        )
+
+        imageFile.outputStream().use {
             it.write(bytes)
         }
 
-        uri
+        imageFile.absolutePath
+    } catch (_: Exception) {
+        null
+    }
+}
+
+fun openShareAddImageInputStream(context: Context, imageRef: String) = try {
+    val file = File(imageRef)
+    if (file.isAbsolute) {
+        if (file.exists()) file.inputStream() else null
+    } else {
+        context.contentResolver.openInputStream(Uri.parse(imageRef))
+    }
+} catch (_: Exception) {
+    null
+}
+
+fun shareAddImageUri(context: Context, imageRef: String): Uri? {
+    return try {
+        val file = File(imageRef)
+        if (file.isAbsolute) {
+            if (!file.exists()) return null
+
+            FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                file
+            )
+        } else {
+            Uri.parse(imageRef)
+        }
     } catch (_: Exception) {
         null
     }
