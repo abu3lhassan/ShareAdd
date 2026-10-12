@@ -535,6 +535,19 @@ fun ShareAddScreen(
                 parts += if (arabic) "لم تتم إضافة $skippedForLimit صورة لتجاوز الحد الأقصى 5 صور" else "$skippedForLimit image(s) not added: maximum is 5 images"
             }
             message = parts.joinToString(" — ")
+
+            // The status message is drawn behind the edit dialog, so warn about images that were not added.
+            if (failedCount > 0 || skippedForLimit > 0) {
+                val warning = listOfNotNull(
+                    if (skippedForLimit > 0) {
+                        if (arabic) "لم تُضف $skippedForLimit صورة: الحد الأقصى 5 صور" else "$skippedForLimit image(s) not added: max 5 images"
+                    } else null,
+                    if (failedCount > 0) {
+                        if (arabic) "تعذر نسخ $failedCount صورة" else "$failedCount image(s) could not be copied"
+                    } else null
+                ).joinToString("\n")
+                Toast.makeText(context, warning, Toast.LENGTH_LONG).show()
+            }
         }
     }
 
