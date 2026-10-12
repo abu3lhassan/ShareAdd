@@ -508,17 +508,33 @@ fun ShareAddScreen(
     val imagePicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments()
     ) { uris ->
-        val copiedImages = uris.take(5).mapNotNull { uri ->
-            copyImageToPrivateStorage(context, uri)
-        }
+        // Picker cancelled or nothing selected: keep the current draft images untouched.
+        if (uris.isNotEmpty()) {
+            val remaining = (5 - images.size).coerceAtLeast(0)
+            val selected = uris.take(remaining)
+            val skippedForLimit = uris.size - selected.size
 
-        images = copiedImages
-        message = if (copiedImages.isNotEmpty()) {
-            if (arabic) "تم حفظ الصور داخل ShareAdd بشكل خاص" else "Images saved privately inside ShareAdd"
-        } else if (uris.isNotEmpty()) {
-            if (arabic) "تعذر إضافة الصور" else "Could not add images"
-        } else {
-            message
+            val copiedImages = selected.mapNotNull { uri ->
+                copyImageToPrivateStorage(context, uri)
+            }
+            val failedCount = selected.size - copiedImages.size
+
+            // Append to the existing draft images; never replace them.
+            if (copiedImages.isNotEmpty()) {
+                images = images + copiedImages
+            }
+
+            val parts = mutableListOf<String>()
+            if (copiedImages.isNotEmpty()) {
+                parts += if (arabic) "تمت إضافة ${copiedImages.size} صورة داخل ShareAdd بشكل خاص" else "${copiedImages.size} image(s) added privately inside ShareAdd"
+            }
+            if (failedCount > 0) {
+                parts += if (arabic) "تعذر إضافة $failedCount صورة" else "Could not add $failedCount image(s)"
+            }
+            if (skippedForLimit > 0) {
+                parts += if (arabic) "لم تتم إضافة $skippedForLimit صورة لتجاوز الحد الأقصى 5 صور" else "$skippedForLimit image(s) not added: maximum is 5 images"
+            }
+            message = parts.joinToString(" — ")
         }
     }
 
@@ -2438,6 +2454,7 @@ fun AddPlaceDialog(
 
                     Button(
                         onClick = onChooseImages,
+                        enabled = images.size < 5,
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text(if (arabic) "اختيار الصور ${images.size}/5" else "Choose Images ${images.size}/5")
