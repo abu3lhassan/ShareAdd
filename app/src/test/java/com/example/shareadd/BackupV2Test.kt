@@ -247,6 +247,27 @@ class BackupV2Test {
     }
 
     @Test
+    fun skipDuplicates_alsoSkipsRepeatsInsideTheFileAndCountsAddUp() {
+        val empty = CurrentData(places = emptyList(), categories = emptyList(), events = emptyList(), templates = emptyList())
+        val snapshot = BackupSnapshot(
+            places = listOf(
+                place("pl-1", "One", "https://maps.app.goo.gl/one"),
+                place("pl-2", "One again", "https://maps.app.goo.gl/one"), // same link inside the file
+                place("pl-3", "Two", "https://maps.app.goo.gl/two")
+            ),
+            categories = emptyList(), settings = BackupSettings(arabic = true, darkMode = false), events = listOf(event("ev-1", "pl-2")), templates = emptyList(),
+            exportedAt = 1, appVersionName = "1.0", appVersionCode = 1
+        )
+        val plan = planImport(empty, stage(exportToBytes(snapshot, emptyMap())), ImportMode.SKIP_DUPLICATES, tmp.newFolder("images"), now = 100)
+        // the numbers shown in the preview
+        assertEquals(3, plan.placesInFile); assertEquals(2, plan.placesAdded); assertEquals(1, plan.placesSkipped)
+        assertEquals(plan.placesInFile, plan.placesAdded + plan.placesSkipped)
+        // and the result that is applied
+        assertEquals(listOf("pl-1", "pl-3"), plan.places.map { it.id })
+        assertEquals("pl-1", plan.events!!.single().placeId) // event of the skipped repeat points to the kept place
+    }
+
+    @Test
     fun mergeAll_addsEverythingAndGivesCollidingIdsNewIds() {
         val (current, staged) = planFixture()
         var n = 0

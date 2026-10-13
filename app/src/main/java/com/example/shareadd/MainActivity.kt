@@ -1228,8 +1228,22 @@ fun ShareAddScreen(
                             verticalArrangement = Arrangement.spacedBy(4.dp)
                         ) {
                             Text(if (arabic) "النتيجة المتوقعة" else "Expected result", fontWeight = FontWeight.SemiBold)
-                            Text(if (arabic) "أماكن ستُضاف: ${plan.placesAdded}" else "Places to add: ${plan.placesAdded}")
-                            if (plan.placesSkipped > 0) Text(if (arabic) "مكررة ستُتخطى: ${plan.placesSkipped}" else "Duplicates skipped: ${plan.placesSkipped}")
+                            if (importMode == ImportMode.SKIP_DUPLICATES) {
+                                // same plan object that is applied on confirm, so these numbers are the result
+                                Text(if (arabic) "أماكن في الملف: ${plan.placesInFile}" else "Places in the file: ${plan.placesInFile}")
+                                Text(if (arabic) "أماكن ستُستورد: ${plan.placesAdded}" else "Places to import: ${plan.placesAdded}")
+                                Text(if (arabic) "أماكن ستُتخطى لأنها مكررة: ${plan.placesSkipped}" else "Places skipped as duplicates: ${plan.placesSkipped}")
+                                Text(
+                                    if (arabic)
+                                        "يُعدّ المكان مكررًا إذا كان موجودًا لديك أو تكرر داخل ملف النسخة نفسه، لذلك قد يُستورد أقل من عدد أماكن الملف حتى لو كانت قائمتك فارغة."
+                                    else
+                                        "A place counts as a duplicate if you already have it or if it repeats inside this backup file, so fewer places than the file holds may be imported even into an empty list.",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            } else {
+                                Text(if (arabic) "أماكن ستُضاف: ${plan.placesAdded}" else "Places to add: ${plan.placesAdded}")
+                                if (plan.placesSkipped > 0) Text(if (arabic) "مكررة ستُتخطى: ${plan.placesSkipped}" else "Duplicates skipped: ${plan.placesSkipped}")
+                            }
                             if (plan.placesRemoved > 0) Text(if (arabic) "أماكن حالية ستُستبدل: ${plan.placesRemoved}" else "Current places replaced: ${plan.placesRemoved}", color = MaterialTheme.colorScheme.error)
                             Text(if (arabic) "عدد الأماكن بعد الاستيراد: ${plan.places.size}" else "Places after import: ${plan.places.size}")
                             Text(if (arabic) "صور ستُضاف: ${plan.imagesToCommit.size}" else "Images to add: ${plan.imagesToCommit.size}")
