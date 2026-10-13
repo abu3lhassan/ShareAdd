@@ -8,6 +8,8 @@ import com.example.shareadd.getShareAddImagesDir
 import com.example.shareadd.openShareAddImageInputStream
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 
@@ -41,17 +43,37 @@ suspend fun exportBackup(
         }
         ExportOutcome.Success(stats)
     } catch (e: CancellationException) {
-        removeIncomplete(context, uri)
+        markExportInterrupted(context)
+        withContext(NonCancellable) { removeIncomplete(context, uri) }
         throw e
     } catch (_: Exception) {
         ExportOutcome.Failed(removeIncomplete(context, uri))
     }
 }
 
-private fun removeIncomplete(context: Context, uri: Uri): Boolean = try {
-    DocumentsContract.deleteDocument(context.contentResolver, uri)
-} catch (_: Exception) {
-    false
+/** LIFE-01: an export stopped because the screen was closed/recreated is reported the next time the app opens. */
+fun markExportInterrupted(context: Context) {
+    context.getSharedPreferences("shareadd_settings", Context.MODE_PRIVATE).edit().putBoolean("exportInterrupted", true).apply()
+}
+
+fun consumeExportInterrupted(context: Context): Boolean {
+    val prefs = context.getSharedPreferences("shareadd_settings", Context.MODE_PRIVATE)
+    val interrupted = prefs.getBoolean("exportInterrupted", false)
+    if (interrupted) prefs.edit().remove("exportInterrupted").apply()
+    return interrupted
+}
+
+/**
+ * Deletes the incomplete document. The provider handles the closing of the file asynchronously; deleting at the
+ * same moment crashed the system Downloads provider on the test emulator (Android 16), so the delete waits briefly.
+ */
+private suspend fun removeIncomplete(context: Context, uri: Uri): Boolean {
+    delay(1500)
+    return try {
+        DocumentsContract.deleteDocument(context.contentResolver, uri)
+    } catch (_: Exception) {
+        false
+    }
 }
 
 /** Reads, validates and stages a backup without changing any app data. */

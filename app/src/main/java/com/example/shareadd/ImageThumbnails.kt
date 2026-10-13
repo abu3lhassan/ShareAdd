@@ -26,8 +26,10 @@ object ImageThumbnails {
     fun load(context: Context, ref: String, targetPx: Int): Bitmap? {
         cached(ref, targetPx)?.let { return it }
         return try {
+            // a bounds-only decode always returns null by design; only the sizes in [bounds] are used
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            openShareAddImageInputStream(context, ref)?.use { BitmapFactory.decodeStream(it, null, bounds) } ?: return null
+            val stream = openShareAddImageInputStream(context, ref) ?: return null
+            stream.use { BitmapFactory.decodeStream(it, null, bounds) }
             if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
 
             val options = BitmapFactory.Options().apply {

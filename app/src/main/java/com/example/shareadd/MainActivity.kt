@@ -25,6 +25,9 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
@@ -32,6 +35,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.listSaver
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.shadow
@@ -55,6 +60,8 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
@@ -79,6 +86,7 @@ import com.example.shareadd.backup.validateStagedImage
 import com.example.shareadd.backup.ExportOutcome
 import com.example.shareadd.backup.PreviewOutcome
 import com.example.shareadd.backup.applyImport
+import com.example.shareadd.backup.consumeExportInterrupted
 import com.example.shareadd.backup.exportBackup
 import com.example.shareadd.backup.planForPreview
 import com.example.shareadd.backup.readBackupForPreview
@@ -125,6 +133,11 @@ enum class ShareAddPage {
     SavedLocations
 }
 
+/** LIFE-01 / SEC-01: unlocked state kept across configuration changes only (a ViewModel does not survive process death). */
+class LockSession : ViewModel() {
+    var unlocked: Boolean? = null
+}
+
 class MainActivity : FragmentActivity() {
 
     private val sharedTextState = mutableStateOf("")
@@ -146,8 +159,9 @@ class MainActivity : FragmentActivity() {
             ShareAddApp(
                 initialSharedText = sharedTextState.value,
                 onSharedTextConsumed = { sharedTextState.value = "" },
-                openBiometric = { onSuccess ->
-                    openBiometric(onSuccess)
+                lockSession = ViewModelProvider(this)[LockSession::class.java],
+                openBiometric = { arabic, onSuccess ->
+                    openBiometric(arabic, onSuccess)
                 }
             )
         }
@@ -172,14 +186,24 @@ class MainActivity : FragmentActivity() {
             ?: ""
     }
 
-    private fun openBiometric(onSuccess: () -> Unit) {
+    private fun openBiometric(arabic: Boolean, onSuccess: () -> Unit) {
         val manager = BiometricManager.from(this)
         val canUse = manager.canAuthenticate(
             BiometricManager.Authenticators.BIOMETRIC_STRONG or
                     BiometricManager.Authenticators.DEVICE_CREDENTIAL
         )
 
-        if (canUse != BiometricManager.BIOMETRIC_SUCCESS) return
+        // BIO-01: the same authenticators as before; when they are not available (no enrolled biometric / device
+        // credential, or this combination is unsupported on Android 9-10), say so instead of doing nothing.
+        if (canUse != BiometricManager.BIOMETRIC_SUCCESS) {
+            Toast.makeText(
+                this,
+                if (arabic) "الفتح بالبصمة غير متاح على هذا الجهاز. استخدم رمز الدخول."
+                else "Biometric unlock is not available here. Use your PIN.",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
 
         val prompt = BiometricPrompt(
             this,
@@ -193,7 +217,7 @@ class MainActivity : FragmentActivity() {
 
         val info = BiometricPrompt.PromptInfo.Builder()
             .setTitle("ShareAdd")
-            .setSubtitle("افتح التطبيق بالبصمة أو رمز الجهاز")
+            .setSubtitle(if (arabic) "افتح التطبيق بالبصمة أو رمز الجهاز" else "Unlock with your biometric or device credential")
             .setAllowedAuthenticators(
                 BiometricManager.Authenticators.BIOMETRIC_STRONG or
                         BiometricManager.Authenticators.DEVICE_CREDENTIAL
@@ -208,11 +232,13 @@ class MainActivity : FragmentActivity() {
 fun ShareAddApp(
     initialSharedText: String,
     onSharedTextConsumed: () -> Unit,
-    openBiometric: (() -> Unit) -> Unit
+    lockSession: LockSession,
+    openBiometric: (Boolean, () -> Unit) -> Unit
 ) {
     val context = LocalContext.current
 
-    var unlocked by remember { mutableStateOf(!hasPin(context)) }
+    // the unlocked state survives a configuration change (rotation) but not process death: a new process starts locked
+    var unlocked by remember { mutableStateOf(lockSession.unlocked ?: !hasPin(context)) }
     var showLockOverlay by remember { mutableStateOf(false) }
 
     var darkMode by remember { mutableStateOf(loadBoolean(context, "darkMode", true)) }
@@ -253,9 +279,15 @@ fun ShareAddApp(
                     arabic = arabic,
                     allowCancel = false,
                     onCancel = {},
-                    onUnlock = { unlocked = true },
+                    onUnlock = {
+                        unlocked = true
+                        lockSession.unlocked = true
+                    },
                     onBiometric = {
-                        openBiometric { unlocked = true }
+                        openBiometric(arabic) {
+                            unlocked = true
+                            lockSession.unlocked = true
+                        }
                     }
                 )
             } else if (showLockOverlay) {
@@ -265,9 +297,15 @@ fun ShareAddApp(
                     arabic = arabic,
                     allowCancel = !hasPin(context),
                     onCancel = { if (!hasPin(context)) showLockOverlay = false },
-                    onUnlock = { showLockOverlay = false },
+                    onUnlock = {
+                        showLockOverlay = false
+                        lockSession.unlocked = true
+                    },
                     onBiometric = {
-                        openBiometric { showLockOverlay = false }
+                        openBiometric(arabic) {
+                            showLockOverlay = false
+                            lockSession.unlocked = true
+                        }
                     }
                 )
             } else {
@@ -282,7 +320,11 @@ fun ShareAddApp(
                         darkMode = imported.darkMode
                         arabic = imported.arabic
                     },
-                    onLock = { showLockOverlay = true }
+                    onLock = {
+                        showLockOverlay = true
+                        // a manual lock with a real PIN stays locked across rotation
+                        if (hasPin(context)) lockSession.unlocked = false
+                    }
                 )
             }
         }
@@ -497,18 +539,30 @@ fun ShareAddScreen(
         return true
     }
 
-    var placeName by remember { mutableStateOf("") }
-    var title by remember { mutableStateOf("") }
-    var url by remember { mutableStateOf(extractUrl(initialSharedText)) }
-    var desc by remember { mutableStateOf(if (initialSharedText.isNotBlank()) initialSharedText.take(250) else "") }
-    var privateNotes by remember { mutableStateOf("") }
-    var rating by remember { mutableStateOf(0) }
-    var favorite by remember { mutableStateOf(false) }
-    var pinned by remember { mutableStateOf(false) }
-    var category by remember { mutableStateOf(categories.firstOrNull() ?: defaultCategories().first()) }
+    // LIFE-01: the editor draft survives activity recreation (rotation, theme/locale change, process restore).
+    // Only text and image file references are saved — never bitmaps.
+    var placeName by rememberSaveable { mutableStateOf("") }
+    var title by rememberSaveable { mutableStateOf("") }
+    var url by rememberSaveable { mutableStateOf(extractUrl(initialSharedText)) }
+    var desc by rememberSaveable { mutableStateOf(if (initialSharedText.isNotBlank()) initialSharedText.take(250) else "") }
+    var privateNotes by rememberSaveable { mutableStateOf("") }
+    var rating by rememberSaveable { mutableStateOf(0) }
+    var favorite by rememberSaveable { mutableStateOf(false) }
+    var pinned by rememberSaveable { mutableStateOf(false) }
+    var category by rememberSaveable(stateSaver = CategorySaver) { mutableStateOf(categories.firstOrNull() ?: defaultCategories().first()) }
     var search by remember { mutableStateOf("") }
-    var images by remember { mutableStateOf(listOf<String>()) }
-    var message by remember {
+    var images by rememberSaveable(stateSaver = StringListSaver) { mutableStateOf(listOf<String>()) }
+    // DATA-04: true once the user picks a category in the editor; automatic suggestions never override it
+    var categoryTouched by rememberSaveable { mutableStateOf(false) }
+    // DATA-08: the draft as it was when the editor opened, to detect unsaved changes
+    var draftBaseline by rememberSaveable { mutableStateOf("") }
+    var showDiscardConfirm by rememberSaveable { mutableStateOf(false) }
+
+    fun draftSignature(): String = listOf(
+        placeName, title, url, desc, privateNotes, rating.toString(), favorite.toString(), pinned.toString(),
+        category.ar, category.en, images.joinToString("\u0002")
+    ).joinToString("\u0001")
+    var message by rememberSaveable {
         mutableStateOf(
             if (initialSharedText.isNotBlank())
                 if (arabic) "تم استلام رابط من المشاركة" else "Shared link received"
@@ -517,6 +571,18 @@ fun ShareAddScreen(
     }
 
     LaunchedEffect(Unit) {
+        // the cancelled export (old screen) may record its interruption a moment after this screen starts
+        launch {
+            repeat(2) { attempt ->
+                if (attempt > 0) kotlinx.coroutines.delay(2500)
+                if (consumeExportInterrupted(context)) {
+                    message = if (arabic)
+                        "توقف التصدير السابق قبل اكتماله (أُغلقت الشاشة أو أعيد إنشاؤها) وحُذف الملف غير المكتمل. أعد التصدير."
+                    else
+                        "The previous export stopped before finishing (the screen was closed or recreated) and the incomplete file was removed. Please export again."
+                }
+            }
+        }
         if (!storageWritable) return@LaunchedEffect
         if (placesLoad.repairedIds > 0) {
             message = if (arabic)
@@ -553,8 +619,8 @@ fun ShareAddScreen(
         }
     }
 
-    var showAddDialog by remember { mutableStateOf(false) }
-    var editingPlaceId by remember { mutableStateOf<String?>(null) }
+    var showAddDialog by rememberSaveable { mutableStateOf(false) }
+    var editingPlaceId by rememberSaveable { mutableStateOf<String?>(null) }
     var showCategoryManager by remember { mutableStateOf(false) }
     var showPinChange by remember { mutableStateOf(false) }
     var showAboutDialog by remember { mutableStateOf(false) }
@@ -590,6 +656,8 @@ fun ShareAddScreen(
         pinned = place.pinned
         images = place.images
         category = Category(place.categoryAr, place.categoryEn)
+        categoryTouched = false
+        draftBaseline = draftSignature()
         showAddDialog = true
     }
 
@@ -610,6 +678,9 @@ fun ShareAddScreen(
             pinned = false
             images = emptyList()
             category = categories.firstOrNull() ?: defaultCategories().first()
+            category = suggestCategoryFromText(url, desc, categories, category)
+            categoryTouched = false
+            draftBaseline = draftSignature()
             message = if (arabic) "تم استلام موقع من المشاركة" else "Location received from share"
             showAddDialog = true
         }
@@ -732,7 +803,15 @@ fun ShareAddScreen(
                         "Backup export failed" + if (outcome.incompleteFileRemoved) "; the incomplete file was removed" else "; an incomplete file may remain at the chosen location — delete it and do not rely on it"
                     }
                 }
-                Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                // short notice; the full result stays in the status line on the main screen
+                Toast.makeText(
+                    context,
+                    if (outcome is ExportOutcome.Success)
+                        if (arabic) "تم حفظ النسخة الاحتياطية — التفاصيل في الشاشة" else "Backup saved — details on screen"
+                    else
+                        if (arabic) "فشل تصدير النسخة الاحتياطية" else "Backup export failed",
+                    Toast.LENGTH_LONG
+                ).show()
             }
         }
     }
@@ -1123,7 +1202,14 @@ fun ShareAddScreen(
                             } else {
                                 message = if (arabic) "فشل الاستيراد ولم يتم تغيير أي بيانات." else "Import failed; no data was changed."
                             }
-                            Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                            Toast.makeText(
+                                context,
+                                if (failure == null)
+                                    if (arabic) "تم تطبيق الاستيراد — التفاصيل في الشاشة" else "Import applied — details on screen"
+                                else
+                                    if (arabic) "لم يكتمل الاستيراد — التفاصيل في الشاشة" else "Import not completed — details on screen",
+                                Toast.LENGTH_LONG
+                            ).show()
                         }
                     }
                 ) {
@@ -1133,6 +1219,28 @@ fun ShareAddScreen(
             dismissButton = {
                 OutlinedButton(onClick = { cancelImport() }) {
                     Text(if (arabic) "إلغاء" else "Cancel")
+                }
+            }
+        )
+    }
+
+    if (showDiscardConfirm && showAddDialog) {
+        AlertDialog(
+            onDismissRequest = { showDiscardConfirm = false },
+            title = { Text(if (arabic) "تجاهل التعديلات؟" else "Discard changes?") },
+            text = { Text(if (arabic) "لديك تعديلات غير محفوظة على هذا العنوان." else "You have unsaved changes to this address.") },
+            confirmButton = {
+                Button(onClick = {
+                    showDiscardConfirm = false
+                    showAddDialog = false
+                    editingPlaceId = null
+                }) {
+                    Text(if (arabic) "تجاهل" else "Discard")
+                }
+            },
+            dismissButton = {
+                OutlinedButton(onClick = { showDiscardConfirm = false }) {
+                    Text(if (arabic) "متابعة التعديل" else "Keep editing")
                 }
             }
         )
@@ -1309,12 +1417,12 @@ fun ShareAddScreen(
             onTitleChange = { title = it },
             onUrlChange = {
                 url = it
-                category = suggestCategoryFromText(it, desc, categories, category)
+                if (editingPlaceId == null && !categoryTouched) category = suggestCategoryFromText(it, desc, categories, category)
             },
             onDescChange = {
                 if (it.length <= 250) {
                     desc = it
-                    category = suggestCategoryFromText(url, it, categories, category)
+                    if (editingPlaceId == null && !categoryTouched) category = suggestCategoryFromText(url, it, categories, category)
                 }
             },
             onPrivateNotesChange = { privateNotes = it },
@@ -1324,7 +1432,10 @@ fun ShareAddScreen(
             },
             onFavoriteChange = { favorite = it },
             onPinnedChange = { pinned = it },
-            onCategoryChange = { category = it },
+            onCategoryChange = {
+                category = it
+                categoryTouched = true
+            },
             onChooseImages = { imagePicker.launch(arrayOf("image/*")) },
             onRemoveImage = { removeUri ->
                 images = images.filterNot { it == removeUri }
@@ -1333,6 +1444,14 @@ fun ShareAddScreen(
             onDismiss = {
                 showAddDialog = false
                 editingPlaceId = null
+            },
+            onDismissRequest = {
+                if (draftSignature() != draftBaseline) {
+                    showDiscardConfirm = true
+                } else {
+                    showAddDialog = false
+                    editingPlaceId = null
+                }
             },
             onSave = {
                 val checkedUrl = normalizeMapUrl(url)
@@ -1414,6 +1533,8 @@ fun ShareAddScreen(
         pinned = false
         images = emptyList()
         category = categories.firstOrNull() ?: defaultCategories().first()
+        categoryTouched = false
+        draftBaseline = draftSignature()
         showAddDialog = true
     }
 
@@ -2207,6 +2328,7 @@ fun TopQuickControls(
             ) {
                 Text(
                     "☰",
+                    modifier = Modifier.semantics { contentDescription = if (arabic) "فتح القائمة" else "Open menu" },
                     style = MaterialTheme.typography.titleLarge,
                     color = MaterialTheme.colorScheme.onSurface,
                     fontWeight = FontWeight.Bold
@@ -2235,6 +2357,9 @@ fun TopQuickControls(
                 ) {
                     Text(
                         text = if (arabic) "عربي" else "EN",
+                        modifier = Modifier.semantics {
+                            contentDescription = if (arabic) "اللغة العربية، اضغط للتبديل إلى الإنجليزية" else "English, tap to switch to Arabic"
+                        },
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.primary
                     )
@@ -2254,6 +2379,12 @@ fun TopQuickControls(
                 ) {
                     Text(
                         text = if (darkMode) "☀️" else "🌙",
+                        modifier = Modifier.semantics {
+                            contentDescription = if (darkMode)
+                                if (arabic) "التبديل إلى الوضع الفاتح" else "Switch to light mode"
+                            else
+                                if (arabic) "التبديل إلى الوضع الداكن" else "Switch to dark mode"
+                        },
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
                     )
@@ -2397,7 +2528,7 @@ fun DrawerContent(
 
         if (lastBackupAt > 0L) {
             Text(
-                if (arabic) "آخر تصدير ناجح للملف: ${formatDate(lastBackupAt)}" else "Last successful export: ${formatDate(lastBackupAt)}",
+                if (arabic) "آخر تصدير ناجح للملف: ${formatDate(lastBackupAt, arabic)}" else "Last successful export: ${formatDate(lastBackupAt, arabic)}",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.secondary,
                 textAlign = TextAlign.Center,
@@ -2644,10 +2775,11 @@ fun AddPlaceDialog(
     onRemoveImage: (String) -> Unit,
     onManageCategories: () -> Unit,
     onDismiss: () -> Unit,
+    onDismissRequest: () -> Unit,
     onSave: () -> Unit
 ) {
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = onDismissRequest,
         title = {
             Text(
                 if (editing)
@@ -2784,11 +2916,19 @@ fun AddPlaceDialog(
                     if (images.isNotEmpty()) {
                         Spacer(Modifier.height(10.dp))
                         LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            items(images) { uri ->
+                            itemsIndexed(images) { index, uri ->
                                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                    ImagePreview(uri, 92)
+                                    ImagePreview(
+                                        uri, 92,
+                                        contentDescription = if (arabic) "صورة المكان ${index + 1} من ${images.size}" else "Place image ${index + 1} of ${images.size}"
+                                    )
                                     TextButton(onClick = { onRemoveImage(uri) }) {
-                                        Text(if (arabic) "حذف" else "Remove")
+                                        Text(
+                                            if (arabic) "حذف" else "Remove",
+                                            modifier = Modifier.semantics {
+                                                contentDescription = if (arabic) "حذف الصورة ${index + 1}" else "Remove image ${index + 1}"
+                                            }
+                                        )
                                     }
                                 }
                             }
@@ -2861,7 +3001,7 @@ fun PlaceDetailsDialog(
                                     .background(Color(0xFF211D29), RoundedCornerShape(24.dp)),
                                 contentAlignment = Alignment.Center
                             ) {
-                                ImagePreview(place.images.first(), 180)
+                                ImagePreview(place.images.first(), 180, contentDescription = if (arabic) "صورة المكان 1" else "Place image 1")
                             }
                             Spacer(Modifier.height(14.dp))
                         } else {
@@ -2947,12 +3087,12 @@ fun PlaceDetailsDialog(
                     ) {
                         PremiumMiniInfo(
                             title = if (arabic) "أضيف" else "Created",
-                            value = formatDate(place.createdAt),
+                            value = formatDate(place.createdAt, arabic),
                             modifier = Modifier.weight(1f)
                         )
                         PremiumMiniInfo(
                             title = if (arabic) "آخر تعديل" else "Updated",
-                            value = formatDate(place.updatedAt),
+                            value = formatDate(place.updatedAt, arabic),
                             modifier = Modifier.weight(1f)
                         )
                     }
@@ -2967,8 +3107,8 @@ fun PlaceDetailsDialog(
                         )
                         Spacer(Modifier.height(8.dp))
                         LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            items(place.images.drop(1)) { uri ->
-                                ImagePreview(uri, 104)
+                            itemsIndexed(place.images.drop(1)) { index, uri ->
+                                ImagePreview(uri, 104, contentDescription = if (arabic) "صورة المكان ${index + 2}" else "Place image ${index + 2}")
                             }
                         }
                     }
@@ -3120,15 +3260,22 @@ fun ChangePinDialog(
     var newPin by remember { mutableStateOf("") }
     var confirmPin by remember { mutableStateOf("") }
     var error by remember { mutableStateOf("") }
+    // PIN-02: without an existing PIN this dialog creates one; with a PIN the current PIN is always required
+    val pinExists = remember { hasPin(context) }
 
     AlertDialog(
         onDismissRequest = onClose,
         title = {
-            Text(if (arabic) "تغيير رمز الدخول" else "Change PIN")
+            Text(
+                if (pinExists)
+                    if (arabic) "تغيير رمز الدخول" else "Change PIN"
+                else
+                    if (arabic) "إنشاء رمز دخول" else "Create PIN"
+            )
         },
         text = {
             Column {
-                OutlinedTextField(
+                if (pinExists) OutlinedTextField(
                     value = oldPin,
                     onValueChange = {
                         if (it.length <= 6 && it.all { c -> c.isDigit() }) oldPin = it
@@ -3140,14 +3287,21 @@ fun ChangePinDialog(
                     modifier = Modifier.fillMaxWidth()
                 )
 
-                Spacer(Modifier.height(8.dp))
+                if (pinExists) Spacer(Modifier.height(8.dp))
 
                 OutlinedTextField(
                     value = newPin,
                     onValueChange = {
                         if (it.length <= 6 && it.all { c -> c.isDigit() }) newPin = it
                     },
-                    label = { Text(if (arabic) "الرمز الجديد - اتركه فاضي لحذف القفل" else "New PIN - Leave Empty To Remove Lock") },
+                    label = {
+                        Text(
+                            if (pinExists)
+                                if (arabic) "الرمز الجديد - اتركه فاضي لحذف القفل" else "New PIN - Leave Empty To Remove Lock"
+                            else
+                                if (arabic) "الرمز الجديد (4 أرقام أو أكثر)" else "New PIN (4 digits or more)"
+                        )
+                    },
                     visualTransformation = PasswordVisualTransformation(),
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
                     singleLine = true,
@@ -3178,12 +3332,15 @@ fun ChangePinDialog(
             Button(
                 onClick = {
                     when {
-                        !checkPin(context, oldPin) -> {
+                        pinExists && !checkPin(context, oldPin) -> {
                             error = if (arabic) "الرمز الحالي غير صحيح" else "Current PIN Is Incorrect"
                         }
-                        newPin.isBlank() && confirmPin.isBlank() -> {
+                        pinExists && newPin.isBlank() && confirmPin.isBlank() -> {
                             clearPin(context)
                             onSuccess()
+                        }
+                        !pinExists && newPin.length < 4 -> {
+                            error = if (arabic) "الرمز لازم يكون 4 أرقام أو أكثر" else "PIN must be at least 4 digits"
                         }
                         newPin.length < 4 -> {
                             error = if (arabic)
@@ -3358,50 +3515,69 @@ fun categoryName(category: Category, arabic: Boolean): String {
     return if (arabic) category.ar else category.en
 }
 
+/** Query words that are expanded to alternatives; a word matches when ANY alternative is present (SRCH-01). */
+private val SEARCH_SYNONYMS: Map<String, List<String>> = mapOf(
+    "مطعم" to listOf("مطعم", "مطاعم", "restaurant"),
+    "كافيه" to listOf("كافيه", "مطاعم", "cafe", "coffee"),
+    "كوفي" to listOf("كوفي", "مطاعم", "cafe", "coffee"),
+    "فندق" to listOf("فندق", "أماكن", "hotel"),
+    "مكتب" to listOf("مكتب", "عمل", "work", "office")
+)
+
+/** An explicit rating request: a number 1-5 next to a star word or ⭐ (e.g. "5 نجوم", "4 stars", "⭐3", "3⭐"). */
+private val RATING_QUERY = Regex("""(?:(\d)\s*(?:نجوم|نجمة|نجمات|stars?|⭐)|⭐\s*(\d))""")
+
+private fun normalizeDigits(text: String): String = buildString(text.length) {
+    for (c in text) {
+        append(
+            when (c) {
+                in '٠'..'٩' -> '0' + (c - '٠')
+                in '۰'..'۹' -> '0' + (c - '۰')
+                else -> c
+            }
+        )
+    }
+}
+
 fun matchesSmartSearch(place: Place, query: String): Boolean {
-    val cleanQuery = query.trim().lowercase()
+    var cleanQuery = normalizeDigits(query.trim().lowercase())
     if (cleanQuery.isBlank()) return true
 
-    val searchableText = listOf(
-        place.placeName,
-        place.title,
-        place.url,
-        place.description,
-        place.privateNotes,
-        place.categoryAr,
-        place.categoryEn,
-        if (place.favorite) "favorite مفضلة مفضل" else "",
-        if (place.pinned) "pinned مثبت مثبتة" else "",
-        "${place.rating} stars ${place.rating} نجوم ${place.rating} star",
-        if (place.rating == 5) "top rated five stars 5 نجوم ممتاز" else ""
-    ).joinToString(" ").lowercase()
+    val searchableText = normalizeDigits(
+        listOf(
+            place.placeName,
+            place.title,
+            place.url,
+            place.description,
+            place.privateNotes,
+            place.categoryAr,
+            place.categoryEn,
+            if (place.favorite) "favorite مفضلة مفضل" else "",
+            if (place.pinned) "pinned مثبت مثبتة" else "",
+            if (place.rating == 5) "top rated five stars ممتاز" else ""
+        ).joinToString(" ").lowercase()
+    )
 
-    val normalized = cleanQuery
-        .replace("⭐", " star ")
-        .replace("نجمة", "نجوم")
-        .replace("مطعم", "مطاعم restaurant restaurants")
-        .replace("كافيه", "مطاعم cafe coffee")
-        .replace("كوفي", "مطاعم cafe coffee")
-        .replace("فندق", "أماكن hotel")
-        .replace("مكتب", "عمل work office")
-
-    val ratingWanted = Regex("""([0-9]+)[ ]*(نجوم|star|stars)?""")
-        .find(normalized)
-        ?.groupValues
-        ?.getOrNull(1)
-        ?.toIntOrNull()
-
-    if (ratingWanted != null && ratingWanted in 1..5 && place.rating != ratingWanted) {
-        return false
+    // SRCH-01: a number is a rating filter only when the query says so ("Floor 2" / "بوابة 3" stay plain text)
+    RATING_QUERY.find(cleanQuery)?.let { match ->
+        val wanted = (match.groupValues[1].ifEmpty { match.groupValues[2] }).toIntOrNull()
+        if (wanted != null && wanted in 1..5) {
+            if (place.rating != wanted) return false
+            cleanQuery = cleanQuery.removeRange(match.range)
+        }
     }
 
-    val tokens = normalized
-        .split(Regex("""[ ]+"""))
+    val tokens = cleanQuery
+        .replace("⭐", " ")
+        .split(Regex("""\s+"""))
         .map { it.trim() }
         .filter { it.isNotBlank() }
-        .filterNot { it in listOf("نجوم", "star", "stars") }
 
-    return tokens.all { token -> searchableText.contains(token) }
+    // every word must match; a word with synonyms matches when any of its alternatives is present
+    return tokens.all { token ->
+        val alternatives = SEARCH_SYNONYMS[token] ?: listOf(token)
+        alternatives.any { searchableText.contains(it) }
+    }
 }
 
 fun suggestCategoryFromText(
@@ -3739,7 +3915,7 @@ fun PlaceCard(
                 verticalAlignment = Alignment.Top
             ) {
                 if (place.images.isNotEmpty()) {
-                    ImagePreview(place.images.first(), 82)
+                    ImagePreview(place.images.first(), 82, contentDescription = if (arabic) "صورة المكان" else "Place image")
                 }
 
                 Column(modifier = Modifier.weight(1f)) {
@@ -3920,9 +4096,11 @@ fun copyText(context: Context, text: String) {
     clipboard.setPrimaryClip(ClipData.newPlainText("ShareAdd", text))
 }
 
-fun formatDate(time: Long): String {
+/** I18N-01: formatted for the app language (not the device locale); digits stay Western like the rest of the app. */
+fun formatDate(time: Long, arabic: Boolean): String {
     if (time <= 0L) return "-"
-    val date = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.getDefault())
+    val locale = if (arabic) java.util.Locale.forLanguageTag("ar-u-nu-latn") else java.util.Locale.ENGLISH
+    val date = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", locale)
     return date.format(java.util.Date(time))
 }
 
@@ -4323,3 +4501,14 @@ fun saveLastBackup(context: Context, time: Long) {
 
 fun loadLastBackup(context: Context): Long =
     context.getSharedPreferences("shareadd_settings", Context.MODE_PRIVATE).getLong("lastBackupAt", 0L)
+
+/** LIFE-01 savers for the editor draft (plain strings only). */
+val CategorySaver = listSaver<Category, String>(
+    save = { listOf(it.ar, it.en) },
+    restore = { Category(it[0], it[1]) }
+)
+
+val StringListSaver = listSaver<List<String>, String>(
+    save = { it },
+    restore = { it.toList() }
+)
