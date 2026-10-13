@@ -77,7 +77,9 @@ import com.example.shareadd.backup.CurrentData
 import com.example.shareadd.backup.ImportMode
 import com.example.shareadd.backup.ImportPlan
 import com.example.shareadd.backup.StagedBackup
-import com.example.shareadd.backup.applyImportJournal
+import com.example.shareadd.backup.ImportNotice
+import com.example.shareadd.backup.ImportPhase
+import com.example.shareadd.backup.ImportSession
 import com.example.shareadd.backup.commitImport
 import com.example.shareadd.backup.isTrustedLegacyBackupRef
 import com.example.shareadd.backup.planImport
@@ -85,7 +87,6 @@ import com.example.shareadd.backup.stageBackup
 import com.example.shareadd.backup.validateStagedImage
 import com.example.shareadd.backup.ExportOutcome
 import com.example.shareadd.backup.PreviewOutcome
-import com.example.shareadd.backup.applyImport
 import com.example.shareadd.backup.consumeExportInterrupted
 import com.example.shareadd.backup.exportBackup
 import com.example.shareadd.backup.planForPreview
@@ -155,10 +156,10 @@ class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // finish an import that was interrupted after its journal was written (roll forward), and
-        // remove staging folders of previews that were never confirmed — before any store is read
-        applyImportJournal(this)
-        BackupFiles.cleanupStaleStaging(this)
+        // finish an import that was interrupted after its journal was written (roll forward; a failure keeps the
+        // journal and blocks saving), and remove staging folders of unconfirmed previews — before any store is read.
+        // Skipped while a confirmed import is still being applied in this process (e.g. after a rotation).
+        ImportSession.onActivityCreate(this)
 
         // LIFE-01: a share is handled once; after recreation (rotation, process restore) the same intent is not replayed.
         if (savedInstanceState == null) {
@@ -272,12 +273,24 @@ fun ShareAddApp(
         onSurface = Color(0xFF171721)
     )
 
+    // F-01/F-02: stores are written only while no import is being applied / no recovery is pending
+    val importState by ImportSession.state.collectAsState()
+
+    // after an import or a recovery rewrote the stores, the settings are read again from storage — before the
+    // main screen of that generation is built, so it starts with the imported language/theme
+    var settingsGeneration by remember { mutableStateOf(importState.generation) }
+    if (settingsGeneration != importState.generation) {
+        settingsGeneration = importState.generation
+        darkMode = loadBoolean(context, "darkMode", true)
+        arabic = loadBoolean(context, "arabic", true)
+    }
+
     LaunchedEffect(darkMode) {
-        saveBoolean(context, "darkMode", darkMode)
+        if (ImportSession.canAutoSave()) saveBoolean(context, "darkMode", darkMode)
     }
 
     LaunchedEffect(arabic) {
-        saveBoolean(context, "arabic", arabic)
+        if (ImportSession.canAutoSave()) saveBoolean(context, "arabic", arabic)
     }
 
     CompositionLocalProvider(
@@ -318,24 +331,106 @@ fun ShareAddApp(
                         }
                     }
                 )
+            } else if (importState.phase == ImportPhase.APPLYING) {
+                // the main screen (and its automatic saving) is not composed while an import is written
+                ImportBusyScreen(arabic)
+            } else if (importState.phase == ImportPhase.RECOVERY_REQUIRED) {
+                ImportRecoveryScreen(arabic)
             } else {
-                ShareAddScreen(
-                    initialSharedText = initialSharedText,
-                    onSharedTextConsumed = onSharedTextConsumed,
-                    darkMode = darkMode,
-                    arabic = arabic,
-                    onToggleDark = { darkMode = !darkMode },
-                    onToggleArabic = { arabic = !arabic },
-                    onSettingsImported = { imported ->
-                        darkMode = imported.darkMode
-                        arabic = imported.arabic
-                    },
-                    onLock = {
-                        showLockOverlay = true
-                        // a manual lock with a real PIN stays locked across rotation
-                        if (hasPin(context)) lockSession.unlocked = false
-                    }
+                // a new generation = the stores were rewritten: the screen is rebuilt from storage, never from old memory
+                key(importState.generation) {
+                    ShareAddScreen(
+                        initialSharedText = initialSharedText,
+                        onSharedTextConsumed = onSharedTextConsumed,
+                        darkMode = darkMode,
+                        arabic = arabic,
+                        onToggleDark = { darkMode = !darkMode },
+                        onToggleArabic = { arabic = !arabic },
+                        onLock = {
+                            showLockOverlay = true
+                            // a manual lock with a real PIN stays locked across rotation
+                            if (hasPin(context)) lockSession.unlocked = false
+                        }
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** F-01: shown instead of the main screen while a confirmed import is written (survives rotation). */
+@Composable
+fun ImportBusyScreen(arabic: Boolean) {
+    Box(
+        modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).padding(24.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Card(shape = RoundedCornerShape(28.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+            Column(modifier = Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                CircularProgressIndicator()
+                Spacer(Modifier.height(16.dp))
+                Text(if (arabic) "جارٍ تطبيق الاستيراد…" else "Applying import…", fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center)
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    if (arabic) "لا تغلق التطبيق حتى يكتمل." else "Keep the app open until it finishes.",
+                    style = MaterialTheme.typography.bodySmall,
+                    textAlign = TextAlign.Center
                 )
+            }
+        }
+    }
+}
+
+/**
+ * F-02: an import journal exists but could not be written. Saving stays blocked (the main screen is not composed),
+ * the journal is kept, and the user can retry.
+ */
+@Composable
+fun ImportRecoveryScreen(arabic: Boolean) {
+    val context = LocalContext.current
+    var retrying by remember { mutableStateOf(false) }
+    var lastRetryFailed by remember { mutableStateOf(false) }
+    Box(
+        modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).padding(24.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Card(shape = RoundedCornerShape(28.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+            Column(modifier = Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("⚠️", style = MaterialTheme.typography.headlineMedium)
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    if (arabic) "لم يكتمل استيراد سابق" else "A previous import did not finish",
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    if (arabic)
+                        "تعذر حفظ بيانات الاستيراد على الجهاز. أوقفنا الحفظ والتعديل حتى يكتمل، ولم تُحذف أي بيانات. أعد المحاولة؛ وإن تكرر ذلك فتأكد من وجود مساحة كافية على الجهاز."
+                    else
+                        "The imported data could not be written to the device. Saving and editing are paused until it completes, and no data was deleted. Try again; if it keeps failing, make sure the device has enough free space.",
+                    textAlign = TextAlign.Center
+                )
+                if (lastRetryFailed) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        if (arabic) "لم تنجح المحاولة." else "The retry did not succeed.",
+                        color = MaterialTheme.colorScheme.error,
+                        fontWeight = FontWeight.SemiBold,
+                        textAlign = TextAlign.Center
+                    )
+                }
+                Spacer(Modifier.height(16.dp))
+                Button(
+                    enabled = !retrying,
+                    onClick = {
+                        retrying = true
+                        ImportSession.retryRecovery(context) { ok ->
+                            retrying = false
+                            lastRetryFailed = !ok
+                        }
+                    }
+                ) { Text(if (retrying) if (arabic) "جارٍ المحاولة…" else "Retrying…" else if (arabic) "إعادة المحاولة" else "Try again") }
             }
         }
     }
@@ -510,7 +605,6 @@ fun ShareAddScreen(
     arabic: Boolean,
     onToggleDark: () -> Unit,
     onToggleArabic: () -> Unit,
-    onSettingsImported: (BackupSettings) -> Unit,
     onLock: () -> Unit
 ) {
     val context = LocalContext.current
@@ -535,8 +629,6 @@ fun ShareAddScreen(
     var busyProgress by remember { mutableStateOf("") }
     // date of the last export that completed successfully (never updated on failure / cancel)
     var lastBackupAt by remember { mutableStateOf(loadLastBackup(context)) }
-    // set when an import journal could not be applied: saving stays paused until the app restarts
-    var importNeedsRestart by remember { mutableStateOf(false) }
 
     val storageWarningText = if (arabic)
         "تعذر قراءة بيانات ShareAdd المحفوظة. لم يتم تغيير البيانات الأصلية، وحُفظت نسخة استرداد داخل التطبيق. تم إيقاف الحفظ والتعديل مؤقتًا لحماية بياناتك."
@@ -544,7 +636,7 @@ fun ShareAddScreen(
         "ShareAdd could not read its saved data. The original data was not changed, and a recovery copy was kept inside the app. Saving and editing are paused to protect your data."
 
     fun storageBlocked(): Boolean {
-        if (storageWritable && !importNeedsRestart) return false
+        if (storageWritable && ImportSession.canAutoSave()) return false
         showStorageWarning = true
         return true
     }
@@ -581,6 +673,25 @@ fun ShareAddScreen(
     }
 
     LaunchedEffect(Unit) {
+        // F-01/F-02: outcome of an import (or journal recovery) finished by ImportSession; this screen was built from storage
+        when (val notice = ImportSession.consumeNotice()) {
+            is ImportNotice.Applied -> {
+                val p = notice.plan
+                message = if (arabic)
+                    "تم تطبيق الاستيراد: أُضيف ${p.placesAdded} مكان" + (if (p.placesSkipped > 0) "، وتُخطي ${p.placesSkipped} مكرر" else "") + (if (p.placesRemoved > 0) "، واستُبدل ${p.placesRemoved}" else "") + "، و${p.imagesToCommit.size} صورة" + (if (p.events != null) "، و${p.eventsAdded} مناسبة" else "")
+                else
+                    "Import applied: ${p.placesAdded} place(s) added" + (if (p.placesSkipped > 0) ", ${p.placesSkipped} duplicate(s) skipped" else "") + (if (p.placesRemoved > 0) ", ${p.placesRemoved} replaced" else "") + ", ${p.imagesToCommit.size} image(s)" + (if (p.events != null) ", ${p.eventsAdded} event(s)" else "")
+                Toast.makeText(context, if (arabic) "تم تطبيق الاستيراد — التفاصيل في الشاشة" else "Import applied — details on screen", Toast.LENGTH_LONG).show()
+            }
+            ImportNotice.FailedNoChange -> {
+                message = if (arabic) "فشل الاستيراد ولم يتم تغيير أي بيانات." else "Import failed; no data was changed."
+                Toast.makeText(context, if (arabic) "لم يكتمل الاستيراد — التفاصيل في الشاشة" else "Import not completed — details on screen", Toast.LENGTH_LONG).show()
+            }
+            ImportNotice.Recovered -> {
+                message = if (arabic) "اكتمل استيراد سابق كان قد توقف قبل انتهائه." else "An import that had stopped before finishing was completed."
+            }
+            null -> {}
+        }
         // the cancelled export (old screen) may record its interruption a moment after this screen starts
         launch {
             repeat(2) { attempt ->
@@ -704,19 +815,19 @@ fun ShareAddScreen(
     }
 
     LaunchedEffect(places) {
-        if (storageWritable && !importNeedsRestart) savePlaces(context, places)
+        if (storageWritable && ImportSession.canAutoSave()) savePlaces(context, places)
     }
 
     LaunchedEffect(events) {
-        if (storageWritable && !importNeedsRestart) saveEvents(context, events)
+        if (storageWritable && ImportSession.canAutoSave()) saveEvents(context, events)
     }
 
     LaunchedEffect(customTemplates) {
-        if (storageWritable && !importNeedsRestart) saveTemplates(context, customTemplates)
+        if (storageWritable && ImportSession.canAutoSave()) saveTemplates(context, customTemplates)
     }
 
     LaunchedEffect(categories) {
-        if (storageWritable && !importNeedsRestart) saveCategories(context, categories)
+        if (storageWritable && ImportSession.canAutoSave()) saveCategories(context, categories)
         if (categories.none { it.ar == category.ar && it.en == category.en } && categories.isNotEmpty()) {
             category = categories.first()
         }
@@ -1279,47 +1390,11 @@ fun ShareAddScreen(
                         if (busyText != null) return@Button
                         val confirmedPlan = plan
                         pendingImport = null
-                        busyText = if (arabic) "جارٍ تطبيق الاستيراد…" else "Applying import…"
-                        busyProgress = ""
-                        scope.launch {
-                            val failure = try {
-                                applyImport(context, confirmedPlan, staged)
-                                null
-                            } catch (e: Exception) {
-                                e
-                            } finally {
-                                busyText = null
-                            }
-
-                            if (failure == null) {
-                                // memory now mirrors exactly what was written
-                                places = confirmedPlan.places
-                                confirmedPlan.categories?.let { categories = it }
-                                confirmedPlan.events?.let { events = it }
-                                confirmedPlan.templates?.let { customTemplates = it }
-                                confirmedPlan.settings?.let { onSettingsImported(it) }
-                                message = if (arabic)
-                                    "تم تطبيق الاستيراد: أُضيف ${confirmedPlan.placesAdded} مكان" + (if (confirmedPlan.placesSkipped > 0) "، وتُخطي ${confirmedPlan.placesSkipped} مكرر" else "") + (if (confirmedPlan.placesRemoved > 0) "، واستُبدل ${confirmedPlan.placesRemoved}" else "") + "، و${confirmedPlan.imagesToCommit.size} صورة" + (if (confirmedPlan.events != null) "، و${confirmedPlan.eventsAdded} مناسبة" else "")
-                                else
-                                    "Import applied: ${confirmedPlan.placesAdded} place(s) added" + (if (confirmedPlan.placesSkipped > 0) ", ${confirmedPlan.placesSkipped} duplicate(s) skipped" else "") + (if (confirmedPlan.placesRemoved > 0) ", ${confirmedPlan.placesRemoved} replaced" else "") + ", ${confirmedPlan.imagesToCommit.size} image(s)" + (if (confirmedPlan.events != null) ", ${confirmedPlan.eventsAdded} event(s)" else "")
-                            } else if (BackupFiles.journal(context).exists()) {
-                                // the journal will finish the import on the next start; block saving until then
-                                importNeedsRestart = true
-                                message = if (arabic)
-                                    "لم يكتمل حفظ الاستيراد. أغلق التطبيق وافتحه من جديد لإكماله تلقائيًا؛ تم إيقاف التعديل حتى ذلك."
-                                else
-                                    "The import could not finish writing. Close and reopen the app to complete it automatically; editing is paused until then."
-                            } else {
-                                message = if (arabic) "فشل الاستيراد ولم يتم تغيير أي بيانات." else "Import failed; no data was changed."
-                            }
-                            Toast.makeText(
-                                context,
-                                if (failure == null)
-                                    if (arabic) "تم تطبيق الاستيراد — التفاصيل في الشاشة" else "Import applied — details on screen"
-                                else
-                                    if (arabic) "لم يكتمل الاستيراد — التفاصيل في الشاشة" else "Import not completed — details on screen",
-                                Toast.LENGTH_LONG
-                            ).show()
+                        // F-01: applied by the process-wide ImportSession, so rotation cannot cancel it half-way; this
+                        // screen is replaced by a progress screen and rebuilt from storage when it finishes
+                        if (!ImportSession.startApply(context, confirmedPlan, staged)) {
+                            BackupFiles.deleteStagingDir(context, staged.stagingDir)
+                            message = if (arabic) "يوجد استيراد آخر قيد التطبيق؛ لم يتم تغيير أي بيانات." else "Another import is being applied; no data was changed."
                         }
                     }
                 ) {
