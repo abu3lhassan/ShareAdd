@@ -45,6 +45,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -60,6 +61,35 @@ import org.json.JSONObject
 import java.security.MessageDigest
 import java.io.File
 import java.util.UUID
+import com.example.shareadd.backup.BackupFiles
+import com.example.shareadd.backup.BackupSettings
+import com.example.shareadd.backup.BackupSnapshot
+import com.example.shareadd.backup.BackupException
+import com.example.shareadd.backup.BackupProblem
+import com.example.shareadd.backup.CurrentData
+import com.example.shareadd.backup.ImportMode
+import com.example.shareadd.backup.ImportPlan
+import com.example.shareadd.backup.StagedBackup
+import com.example.shareadd.backup.applyImportJournal
+import com.example.shareadd.backup.commitImport
+import com.example.shareadd.backup.isTrustedLegacyBackupRef
+import com.example.shareadd.backup.planImport
+import com.example.shareadd.backup.stageBackup
+import com.example.shareadd.backup.validateStagedImage
+import com.example.shareadd.backup.ExportOutcome
+import com.example.shareadd.backup.PreviewOutcome
+import com.example.shareadd.backup.applyImport
+import com.example.shareadd.backup.exportBackup
+import com.example.shareadd.backup.planForPreview
+import com.example.shareadd.backup.readBackupForPreview
+import com.example.shareadd.events.InvitationTemplate
+import com.example.shareadd.events.ShareEvent
+import com.example.shareadd.events.loadEventsChecked
+import com.example.shareadd.events.loadTemplatesChecked
+import com.example.shareadd.events.saveEvents
+import com.example.shareadd.events.saveTemplates
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 data class Category(
     val ar: String,
@@ -67,6 +97,8 @@ data class Category(
 )
 
 data class Place(
+    /** stable identity (added in v2; generated once for older records, then saved) */
+    val id: String,
     val placeName: String,
     val title: String,
     val url: String,
@@ -82,9 +114,10 @@ data class Place(
     val updatedAt: Long
 )
 
+/** A backup that was read, validated and staged; nothing is applied until the user confirms. */
 data class PendingImport(
-    val rawJson: String,
-    val previewPlaces: List<Place>
+    val staged: StagedBackup,
+    val fileName: String
 )
 
 enum class ShareAddPage {
@@ -98,6 +131,11 @@ class MainActivity : FragmentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // finish an import that was interrupted after its journal was written (roll forward), and
+        // remove staging folders of previews that were never confirmed — before any store is read
+        applyImportJournal(this)
+        BackupFiles.cleanupStaleStaging(this)
 
         // LIFE-01: a share is handled once; after recreation (rotation, process restore) the same intent is not replayed.
         if (savedInstanceState == null) {
@@ -240,6 +278,10 @@ fun ShareAddApp(
                     arabic = arabic,
                     onToggleDark = { darkMode = !darkMode },
                     onToggleArabic = { arabic = !arabic },
+                    onSettingsImported = { imported ->
+                        darkMode = imported.darkMode
+                        arabic = imported.arabic
+                    },
                     onLock = { showLockOverlay = true }
                 )
             }
@@ -416,6 +458,7 @@ fun ShareAddScreen(
     arabic: Boolean,
     onToggleDark: () -> Unit,
     onToggleArabic: () -> Unit,
+    onSettingsImported: (BackupSettings) -> Unit,
     onLock: () -> Unit
 ) {
     val context = LocalContext.current
@@ -425,11 +468,23 @@ fun ShareAddScreen(
     // DATA-01: when stored data cannot be read, nothing is written back over it (saving is suspended).
     val placesLoad = remember { loadPlacesChecked(context) }
     val categoriesLoad = remember { loadCategoriesChecked(context) }
-    val storageWritable = placesLoad.ok && categoriesLoad.ok
+    val eventsLoad = remember { loadEventsChecked(context) }
+    val templatesLoad = remember { loadTemplatesChecked(context) }
+    val storageWritable = placesLoad.ok && categoriesLoad.ok && eventsLoad.ok && templatesLoad.ok
     var showStorageWarning by remember { mutableStateOf(!storageWritable) }
 
     var places by remember { mutableStateOf(placesLoad.value) }
     var categories by remember { mutableStateOf(categoriesLoad.value) }
+    var events by remember { mutableStateOf(eventsLoad.value) }
+    var customTemplates by remember { mutableStateOf(templatesLoad.value) }
+
+    // a long operation (export / import / copying images) runs in the background; only one at a time
+    var busyText by remember { mutableStateOf<String?>(null) }
+    var busyProgress by remember { mutableStateOf("") }
+    // date of the last export that completed successfully (never updated on failure / cancel)
+    var lastBackupAt by remember { mutableStateOf(loadLastBackup(context)) }
+    // set when an import journal could not be applied: saving stays paused until the app restarts
+    var importNeedsRestart by remember { mutableStateOf(false) }
 
     val storageWarningText = if (arabic)
         "تعذر قراءة بيانات ShareAdd المحفوظة. لم يتم تغيير البيانات الأصلية، وحُفظت نسخة استرداد داخل التطبيق. تم إيقاف الحفظ والتعديل مؤقتًا لحماية بياناتك."
@@ -437,7 +492,7 @@ fun ShareAddScreen(
         "ShareAdd could not read its saved data. The original data was not changed, and a recovery copy was kept inside the app. Saving and editing are paused to protect your data."
 
     fun storageBlocked(): Boolean {
-        if (storageWritable) return false
+        if (storageWritable && !importNeedsRestart) return false
         showStorageWarning = true
         return true
     }
@@ -463,10 +518,24 @@ fun ShareAddScreen(
 
     LaunchedEffect(Unit) {
         if (!storageWritable) return@LaunchedEffect
-        val migration = migratePlacesImagesToPrivateStorage(context, places)
+        if (placesLoad.repairedIds > 0) {
+            message = if (arabic)
+                "تم إصلاح ${placesLoad.repairedIds} معرّف مكان مكرر دون دمج أي سجل"
+            else
+                "${placesLoad.repairedIds} duplicate place id(s) were repaired; no records were merged"
+        }
+        // PERF-02: image migration (file copies) runs off the main thread; only the references it changed are
+        // applied to the current list, so edits made meanwhile are not overwritten.
+        val snapshot = places
+        val migration = withContext(Dispatchers.IO) { migratePlacesImagesToPrivateStorage(context, snapshot) }
         if (migration.changed) {
-            places = migration.places
-            savePlaces(context, migration.places)
+            val replaced = HashMap<String, String>()
+            snapshot.zip(migration.places).forEach { (before, after) ->
+                before.images.zip(after.images).forEach { (old, new) -> if (old != new) replaced[old] = new }
+            }
+            places = places.map { p ->
+                if (p.images.any { it in replaced }) p.copy(images = p.images.map { replaced[it] ?: it }, updatedAt = System.currentTimeMillis()) else p
+            }
         }
         // DATA-06: a partial migration is reported as partial, never as full success
         if (migration.failedCount > 0) {
@@ -485,17 +554,17 @@ fun ShareAddScreen(
     }
 
     var showAddDialog by remember { mutableStateOf(false) }
-    var editingIndex by remember { mutableStateOf<Int?>(null) }
+    var editingPlaceId by remember { mutableStateOf<String?>(null) }
     var showCategoryManager by remember { mutableStateOf(false) }
     var showPinChange by remember { mutableStateOf(false) }
     var showAboutDialog by remember { mutableStateOf(false) }
     var showImportNotice by remember { mutableStateOf(false) }
     var currentPage by remember { mutableStateOf(ShareAddPage.Dashboard) }
     var pendingImport by remember { mutableStateOf<PendingImport?>(null) }
-    var importMode by remember { mutableStateOf("skip") }
+    var importMode by remember { mutableStateOf(ImportMode.SKIP_DUPLICATES) }
     var detailsPlace by remember { mutableStateOf<Place?>(null) }
     var shareOptionsPlace by remember { mutableStateOf<Place?>(null) }
-    var deleteIndex by remember { mutableStateOf<Int?>(null) }
+    var deletePlaceId by remember { mutableStateOf<String?>(null) }
 
     var newCategoryAr by remember { mutableStateOf("") }
     var newCategoryEn by remember { mutableStateOf("") }
@@ -508,13 +577,29 @@ fun ShareAddScreen(
     var onlyPinned by remember { mutableStateOf(false) }
     var sortMode by remember { mutableStateOf("pinned_newest") }
 
+    /** Opens the editor for one saved place, targeted by its id (never by list position). */
+    fun startEdit(place: Place) {
+        editingPlaceId = place.id
+        placeName = place.placeName
+        title = place.title
+        url = place.url
+        desc = place.description
+        privateNotes = place.privateNotes
+        rating = place.rating
+        favorite = place.favorite
+        pinned = place.pinned
+        images = place.images
+        category = Category(place.categoryAr, place.categoryEn)
+        showAddDialog = true
+    }
+
     LaunchedEffect(initialSharedText) {
         if (initialSharedText.isNotBlank()) {
             onSharedTextConsumed()
             if (storageBlocked()) return@LaunchedEffect
             val extractedUrl = extractUrl(initialSharedText)
 
-            editingIndex = null
+            editingPlaceId = null
             placeName = ""
             title = ""
             url = if (extractedUrl.isNotBlank()) extractedUrl else initialSharedText.trim()
@@ -531,11 +616,19 @@ fun ShareAddScreen(
     }
 
     LaunchedEffect(places) {
-        if (storageWritable) savePlaces(context, places)
+        if (storageWritable && !importNeedsRestart) savePlaces(context, places)
+    }
+
+    LaunchedEffect(events) {
+        if (storageWritable && !importNeedsRestart) saveEvents(context, events)
+    }
+
+    LaunchedEffect(customTemplates) {
+        if (storageWritable && !importNeedsRestart) saveTemplates(context, customTemplates)
     }
 
     LaunchedEffect(categories) {
-        if (storageWritable) saveCategories(context, categories)
+        if (storageWritable && !importNeedsRestart) saveCategories(context, categories)
         if (categories.none { it.ar == category.ar && it.en == category.en } && categories.isNotEmpty()) {
             category = categories.first()
         }
@@ -545,44 +638,53 @@ fun ShareAddScreen(
         contract = ActivityResultContracts.OpenMultipleDocuments()
     ) { uris ->
         // Picker cancelled or nothing selected: keep the current draft images untouched.
-        if (uris.isNotEmpty()) {
+        if (uris.isNotEmpty() && busyText == null) {
             val remaining = (5 - images.size).coerceAtLeast(0)
             val selected = uris.take(remaining)
             val skippedForLimit = uris.size - selected.size
 
-            val copiedImages = selected.mapNotNull { uri ->
-                copyImageToPrivateStorage(context, uri)
-            }
-            val failedCount = selected.size - copiedImages.size
+            busyText = if (arabic) "جارٍ إضافة الصور…" else "Adding images…"
+            busyProgress = ""
+            scope.launch {
+                // PERF-02: copying (possibly from a cloud provider) runs off the main thread
+                val copiedImages = try {
+                    withContext(Dispatchers.IO) {
+                        selected.mapNotNull { uri -> copyImageToPrivateStorage(context, uri) }
+                    }
+                } finally {
+                    busyText = null
+                }
+                val failedCount = selected.size - copiedImages.size
 
-            // Append to the existing draft images; never replace them.
-            if (copiedImages.isNotEmpty()) {
-                images = images + copiedImages
-            }
+                // Append to the existing draft images; never replace them.
+                if (copiedImages.isNotEmpty()) {
+                    images = images + copiedImages
+                }
 
-            val parts = mutableListOf<String>()
-            if (copiedImages.isNotEmpty()) {
-                parts += if (arabic) "تمت إضافة ${copiedImages.size} صورة داخل ShareAdd بشكل خاص" else "${copiedImages.size} image(s) added privately inside ShareAdd"
-            }
-            if (failedCount > 0) {
-                parts += if (arabic) "تعذر إضافة $failedCount صورة" else "Could not add $failedCount image(s)"
-            }
-            if (skippedForLimit > 0) {
-                parts += if (arabic) "لم تتم إضافة $skippedForLimit صورة لتجاوز الحد الأقصى 5 صور" else "$skippedForLimit image(s) not added: maximum is 5 images"
-            }
-            message = parts.joinToString(" — ")
+                val parts = mutableListOf<String>()
+                if (copiedImages.isNotEmpty()) {
+                    parts += if (arabic) "تمت إضافة ${copiedImages.size} صورة داخل ShareAdd بشكل خاص" else "${copiedImages.size} image(s) added privately inside ShareAdd"
+                }
+                if (failedCount > 0) {
+                    parts += if (arabic) "تعذر إضافة $failedCount صورة" else "Could not add $failedCount image(s)"
+                }
+                if (skippedForLimit > 0) {
+                    parts += if (arabic) "لم تتم إضافة $skippedForLimit صورة لتجاوز الحد الأقصى 5 صور" else "$skippedForLimit image(s) not added: maximum is 5 images"
+                }
+                message = parts.joinToString(" — ")
 
-            // The status message is drawn behind the edit dialog, so warn about images that were not added.
-            if (failedCount > 0 || skippedForLimit > 0) {
-                val warning = listOfNotNull(
-                    if (skippedForLimit > 0) {
-                        if (arabic) "لم تُضف $skippedForLimit صورة: الحد الأقصى 5 صور" else "$skippedForLimit image(s) not added: max 5 images"
-                    } else null,
-                    if (failedCount > 0) {
-                        if (arabic) "تعذر نسخ $failedCount صورة" else "$failedCount image(s) could not be copied"
-                    } else null
-                ).joinToString("\n")
-                Toast.makeText(context, warning, Toast.LENGTH_LONG).show()
+                // The status message is drawn behind the edit dialog, so warn about images that were not added.
+                if (failedCount > 0 || skippedForLimit > 0) {
+                    val warning = listOfNotNull(
+                        if (skippedForLimit > 0) {
+                            if (arabic) "لم تُضف $skippedForLimit صورة: الحد الأقصى 5 صور" else "$skippedForLimit image(s) not added: max 5 images"
+                        } else null,
+                        if (failedCount > 0) {
+                            if (arabic) "تعذر نسخ $failedCount صورة" else "$failedCount image(s) could not be copied"
+                        } else null
+                    ).joinToString("\n")
+                    Toast.makeText(context, warning, Toast.LENGTH_LONG).show()
+                }
             }
         }
     }
@@ -590,14 +692,47 @@ fun ShareAddScreen(
     val exportLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("application/json")
     ) { uri ->
-        if (uri != null) {
-            try {
-                context.contentResolver.openOutputStream(uri)?.use {
-                    it.write(placesToJsonWithImages(context, places).toByteArray())
+        if (uri != null && busyText == null) {
+            val snapshot = BackupSnapshot(
+                places = places,
+                categories = categories,
+                settings = BackupSettings(arabic = arabic, darkMode = darkMode),
+                events = events,
+                templates = customTemplates,
+                exportedAt = System.currentTimeMillis(),
+                appVersionName = appVersionName(context),
+                appVersionCode = appVersionCode(context)
+            )
+            busyText = if (arabic) "جارٍ تصدير النسخة الاحتياطية…" else "Exporting backup…"
+            busyProgress = ""
+            scope.launch {
+                val outcome = try {
+                    exportBackup(context, uri, snapshot) { done, total ->
+                        busyProgress = if (arabic) "الصور: $done / $total" else "Images: $done / $total"
+                    }
+                } finally {
+                    busyText = null
                 }
-                message = if (arabic) "تم تصدير ملف النسخة الاحتياطية بنجاح. يمكنك حفظه في Google Drive من نافذة أندرويد." else "Backup file exported successfully. You can save it to Google Drive from the Android file picker."
-            } catch (_: Exception) {
-                message = if (arabic) "فشل تصدير ملف النسخة الاحتياطية" else "Backup Export Failed"
+                message = when (outcome) {
+                    is ExportOutcome.Success -> {
+                        saveLastBackup(context, snapshot.exportedAt)
+                        lastBackupAt = snapshot.exportedAt
+                        val s = outcome.stats
+                        val missingNote = if (s.imagesMissing > 0) {
+                            if (arabic) " — تعذر تضمين ${s.imagesMissing} صورة غير متاحة" else " — ${s.imagesMissing} unavailable image(s) could not be included"
+                        } else ""
+                        if (arabic)
+                            "تم حفظ ملف النسخة الاحتياطية (الإصدار 2): ${s.places} مكان، ${s.imagesWritten} صورة، ${s.events} مناسبة، ${s.templates} قالب$missingNote. تم تسليم الملف إلى الموقع المختار؛ تأكد من اكتمال رفعه إن اخترت Google Drive. ملاحظة: الإصدارات القديمة من التطبيق لا تقرأ هذا الملف."
+                        else
+                            "Backup file saved (version 2): ${s.places} places, ${s.imagesWritten} images, ${s.events} events, ${s.templates} templates$missingNote. The file was handed to the chosen location; check that the upload finished if you chose Google Drive. Note: older app versions cannot read this file."
+                    }
+                    is ExportOutcome.Failed -> if (arabic) {
+                        "فشل تصدير النسخة الاحتياطية" + if (outcome.incompleteFileRemoved) "، وتم حذف الملف غير المكتمل" else "؛ قد يبقى ملف غير مكتمل في الموقع المختار — احذفه ولا تعتمد عليه"
+                    } else {
+                        "Backup export failed" + if (outcome.incompleteFileRemoved) "; the incomplete file was removed" else "; an incomplete file may remain at the chosen location — delete it and do not rely on it"
+                    }
+                }
+                Toast.makeText(context, message, Toast.LENGTH_LONG).show()
             }
         }
     }
@@ -605,23 +740,36 @@ fun ShareAddScreen(
     val importLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
-        if (uri != null) {
-            try {
-                val text = context.contentResolver.openInputStream(uri)
-                    ?.bufferedReader()
-                    ?.use { it.readText() }
-                    ?: "[]"
-
-                val previewPlaces = jsonToPlacesForPreview(text)
-
-                if (previewPlaces.isEmpty()) {
-                    message = if (arabic) "ملف النسخة الاحتياطية فارغ أو غير صالح" else "Backup file is empty or invalid"
-                } else {
-                    pendingImport = PendingImport(text, previewPlaces)
-                    importMode = "skip"
+        if (uri != null && busyText == null) {
+            busyText = if (arabic) "جارٍ فحص النسخة الاحتياطية…" else "Checking backup…"
+            busyProgress = ""
+            scope.launch {
+                val outcome = try {
+                    readBackupForPreview(context, uri) { done ->
+                        busyProgress = if (arabic) "الصور المتحقق منها: $done" else "Images checked: $done"
+                    }
+                } finally {
+                    busyText = null
                 }
-            } catch (_: Exception) {
-                message = if (arabic) "فشل قراءة ملف النسخة الاحتياطية" else "Could not read backup file"
+                when (outcome) {
+                    is PreviewOutcome.Ready -> {
+                        pendingImport = PendingImport(outcome.staged, outcome.fileName)
+                        importMode = ImportMode.SKIP_DUPLICATES
+                    }
+                    is PreviewOutcome.Rejected -> {
+                        message = when (outcome.problem) {
+                            BackupProblem.UNSUPPORTED_VERSION -> if (arabic)
+                                "هذا الملف من إصدار أحدث (${outcome.version}) غير مدعوم في هذا التطبيق. لم يتم تغيير أي بيانات."
+                            else
+                                "This backup uses a newer, unsupported version (${outcome.version}). No data was changed."
+                            BackupProblem.NOT_A_BACKUP -> if (arabic) "الملف ليس نسخة احتياطية من ShareAdd. لم يتم تغيير أي بيانات." else "This file is not a ShareAdd backup. No data was changed."
+                            BackupProblem.EMPTY -> if (arabic) "ملف النسخة الاحتياطية فارغ. لم يتم تغيير أي بيانات." else "The backup file is empty. No data was changed."
+                            BackupProblem.IMAGE_CHECK_FAILED -> if (arabic) "صور النسخة الاحتياطية لا تطابق بصمتها (الملف تالف). لم يتم تغيير أي بيانات." else "Backup images do not match their checksums (damaged file). No data was changed."
+                            BackupProblem.DAMAGED -> if (arabic) "ملف النسخة الاحتياطية تالف أو غير مكتمل. لم يتم تغيير أي بيانات." else "The backup file is damaged or incomplete. No data was changed."
+                        }
+                        Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                    }
+                }
             }
         }
     }
@@ -677,22 +825,8 @@ fun ShareAddScreen(
             onEdit = {
                 if (storageBlocked()) return@PlaceDetailsDialog
                 val place = detailsPlace!!
-                val realIndex = places.indexOf(place)
-                if (realIndex >= 0) {
-                    editingIndex = realIndex
-                    placeName = place.placeName
-                    title = place.title
-                    url = place.url
-                    desc = place.description
-                    privateNotes = place.privateNotes
-                    rating = place.rating
-                    favorite = place.favorite
-                    pinned = place.pinned
-                    images = place.images
-                    category = Category(place.categoryAr, place.categoryEn)
-                    detailsPlace = null
-                    showAddDialog = true
-                }
+                detailsPlace = null
+                startEdit(place)
             }
         )
     }
@@ -722,26 +856,41 @@ fun ShareAddScreen(
         )
     }
 
-    if (deleteIndex != null) {
+    if (deletePlaceId != null) {
+        val linkedEvents = events.count { it.placeId == deletePlaceId }
         AlertDialog(
-            onDismissRequest = { deleteIndex = null },
+            onDismissRequest = { deletePlaceId = null },
             title = { Text(if (arabic) "تأكيد الحذف" else "Confirm Delete") },
-            text = { Text(if (arabic) "هل تريد حذف هذا العنوان؟" else "Do you want to delete this address?") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(if (arabic) "هل تريد حذف هذا العنوان؟" else "Do you want to delete this address?")
+                    if (linkedEvents > 0) {
+                        Text(
+                            if (arabic)
+                                "تنبيه: يرتبط بهذا المكان $linkedEvents من المناسبات. لن تُحذف، وستحتفظ ببيانات الموقع المحفوظة فيها."
+                            else
+                                "Note: $linkedEvents event(s) use this place. They will not be deleted and keep their saved location details.",
+                            color = MaterialTheme.colorScheme.error,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+            },
             confirmButton = {
                 Button(
                     onClick = {
-                        val index = deleteIndex
-                        if (index != null && index in places.indices) {
-                            places = places.filterIndexed { i, _ -> i != index }
+                        val id = deletePlaceId
+                        if (id != null) {
+                            places = places.filterNot { it.id == id }
                         }
-                        deleteIndex = null
+                        deletePlaceId = null
                     }
                 ) {
                     Text(if (arabic) "حذف" else "Delete")
                 }
             },
             dismissButton = {
-                OutlinedButton(onClick = { deleteIndex = null }) {
+                OutlinedButton(onClick = { deletePlaceId = null }) {
                     Text(if (arabic) "إلغاء" else "Cancel")
                 }
             }
@@ -790,13 +939,20 @@ fun ShareAddScreen(
     }
 
     if (pendingImport != null) {
-        val importedPreview = pendingImport!!.previewPlaces
-        val currentKeys = places.map { placeImportKey(it) }.toSet()
-        val duplicateCount = importedPreview.count { placeImportKey(it) in currentKeys }
-        val imageCount = importedPreview.sumOf { it.images.size }
+        val pending = pendingImport!!
+        val staged = pending.staged
+        val current = CurrentData(places, categories, events, customTemplates)
+        val plan = remember(pending, importMode, places, categories, events, customTemplates) {
+            planForPreview(context, current, staged, importMode)
+        }
+
+        fun cancelImport() {
+            BackupFiles.deleteStagingDir(context, staged.stagingDir)
+            pendingImport = null
+        }
 
         AlertDialog(
-            onDismissRequest = { pendingImport = null },
+            onDismissRequest = { cancelImport() },
             title = {
                 Text(
                     if (arabic) "معاينة الاستيراد" else "Import Preview",
@@ -827,10 +983,36 @@ fun ShareAddScreen(
                                 .padding(14.dp),
                             verticalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
+                            if (pending.fileName.isNotBlank()) Text(pending.fileName, fontWeight = FontWeight.SemiBold)
+                            Text(
+                                if (staged.formatVersion >= 2)
+                                    if (arabic) "صيغة النسخة: الإصدار ${staged.formatVersion}" else "Backup format: version ${staged.formatVersion}"
+                                else
+                                    if (arabic) "صيغة النسخة: قديمة (الإصدار 1)" else "Backup format: old (version 1)"
+                            )
                             Text(if (arabic) "الأماكن الحالية: ${places.size}" else "Current places: ${places.size}")
-                            Text(if (arabic) "الأماكن داخل الملف: ${importedPreview.size}" else "Places in backup: ${importedPreview.size}")
-                            Text(if (arabic) "المكررات المحتملة: $duplicateCount" else "Possible duplicates: $duplicateCount")
-                            Text(if (arabic) "الصور داخل الملف: $imageCount" else "Images in backup: $imageCount")
+                            Text(if (arabic) "الأماكن داخل الملف: ${plan.placesInFile}" else "Places in backup: ${plan.placesInFile}")
+                            Text(if (arabic) "الصور السليمة داخل الملف: ${staged.stats.imagesEmbedded}" else "Valid images in backup: ${staged.stats.imagesEmbedded}")
+                            if (staged.stats.legacyRefsKept > 0) {
+                                Text(if (arabic) "مراجع صور قديمة بلا بيانات: ${staged.stats.legacyRefsKept}" else "Old image references without data: ${staged.stats.legacyRefsKept}")
+                            }
+                            if (staged.stats.imagesRejected + staged.stats.refsRejected > 0) {
+                                Text(
+                                    if (arabic) "صور أو مراجع مرفوضة لعدم سلامتها: ${staged.stats.imagesRejected + staged.stats.refsRejected}" else "Rejected unsafe/invalid images or references: ${staged.stats.imagesRejected + staged.stats.refsRejected}",
+                                    color = MaterialTheme.colorScheme.error
+                                )
+                            }
+                            if (staged.formatVersion >= 2) {
+                                Text(if (arabic) "التصنيفات: ${staged.categories?.size ?: 0} — المناسبات: ${plan.eventsInFile} — القوالب المخصصة: ${plan.templatesInFile}" else "Categories: ${staged.categories?.size ?: 0} — Events: ${plan.eventsInFile} — Custom templates: ${plan.templatesInFile}")
+                            } else {
+                                Text(
+                                    if (arabic)
+                                        "هذه نسخة قديمة لا تحتوي التصنيفات أو الإعدادات أو المناسبات أو القوالب؛ ستبقى الموجودة لديك كما هي."
+                                    else
+                                        "This old backup has no categories, settings, events or templates; your existing ones stay as they are.",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
                         }
                     }
 
@@ -840,27 +1022,60 @@ fun ShareAddScreen(
                     )
 
                     ImportModeRow(
-                        selected = importMode == "skip",
+                        selected = importMode == ImportMode.SKIP_DUPLICATES,
                         title = if (arabic) "دمج آمن: تخطي المكرر" else "Safe merge: skip duplicates",
                         subtitle = if (arabic) "الأفضل حاليًا. يضيف الجديد فقط." else "Recommended. Adds new places only.",
-                        onClick = { importMode = "skip" }
+                        onClick = { importMode = ImportMode.SKIP_DUPLICATES }
                     )
 
                     ImportModeRow(
-                        selected = importMode == "merge",
+                        selected = importMode == ImportMode.MERGE_ALL,
                         title = if (arabic) "دمج الكل" else "Merge all",
                         subtitle = if (arabic) "يضيف كل ما في الملف حتى لو تكرر." else "Adds everything from the file, even duplicates.",
-                        onClick = { importMode = "merge" }
+                        onClick = { importMode = ImportMode.MERGE_ALL }
                     )
 
                     ImportModeRow(
-                        selected = importMode == "replace",
+                        selected = importMode == ImportMode.REPLACE_ALL,
                         title = if (arabic) "استبدال الكل" else "Replace all",
                         subtitle = if (arabic) "يحذف القائمة الحالية ويستبدلها بالملف." else "Replaces your current list with this backup.",
-                        onClick = { importMode = "replace" }
+                        onClick = { importMode = ImportMode.REPLACE_ALL }
                     )
 
-                    if (importMode == "replace") {
+                    Surface(
+                        shape = RoundedCornerShape(18.dp),
+                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Text(if (arabic) "النتيجة المتوقعة" else "Expected result", fontWeight = FontWeight.SemiBold)
+                            Text(if (arabic) "أماكن ستُضاف: ${plan.placesAdded}" else "Places to add: ${plan.placesAdded}")
+                            if (plan.placesSkipped > 0) Text(if (arabic) "مكررة ستُتخطى: ${plan.placesSkipped}" else "Duplicates skipped: ${plan.placesSkipped}")
+                            if (plan.placesRemoved > 0) Text(if (arabic) "أماكن حالية ستُستبدل: ${plan.placesRemoved}" else "Current places replaced: ${plan.placesRemoved}", color = MaterialTheme.colorScheme.error)
+                            Text(if (arabic) "عدد الأماكن بعد الاستيراد: ${plan.places.size}" else "Places after import: ${plan.places.size}")
+                            Text(if (arabic) "صور ستُضاف: ${plan.imagesToCommit.size}" else "Images to add: ${plan.imagesToCommit.size}")
+                            if (plan.placeIdsChanged > 0) Text(if (arabic) "أماكن مكررة المعرف ستأخذ معرفًا جديدًا: ${plan.placeIdsChanged}" else "Places given a new id (id already used): ${plan.placeIdsChanged}")
+                            if (plan.events != null) Text(if (arabic) "مناسبات ستُضاف: ${plan.eventsAdded}" + (if (plan.eventsSkipped > 0) " — مكررة: ${plan.eventsSkipped}" else "") else "Events to add: ${plan.eventsAdded}" + (if (plan.eventsSkipped > 0) " — duplicates: ${plan.eventsSkipped}" else ""))
+                            if (plan.eventsRelinked > 0) Text(if (arabic) "مناسبات سيُعاد ربطها بالمكان الصحيح: ${plan.eventsRelinked}" else "Events re-linked to the right place: ${plan.eventsRelinked}")
+                            if (plan.templates != null) Text(if (arabic) "قوالب ستُضاف: ${plan.templatesAdded}" else "Templates to add: ${plan.templatesAdded}")
+                            if (plan.categories != null) Text(if (arabic) "تصنيفات جديدة: ${plan.categoriesAdded}" + (if (plan.categoriesOverflow > 0) " — تجاوزت الحد 15: ${plan.categoriesOverflow}" else "") else "New categories: ${plan.categoriesAdded}" + (if (plan.categoriesOverflow > 0) " — over the 15 limit: ${plan.categoriesOverflow}" else ""))
+                            if (plan.settingsInFile) {
+                                Text(
+                                    if (plan.settings != null)
+                                        if (arabic) "سيتم تطبيق إعدادات اللغة والمظهر من الملف" else "Language and theme settings from the file will be applied"
+                                    else
+                                        if (arabic) "إعدادات اللغة والمظهر لا تُطبق إلا مع «استبدال الكل»" else "Language and theme settings are applied only with \"Replace all\"",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                        }
+                    }
+
+                    if (importMode == ImportMode.REPLACE_ALL) {
                         Text(
                             if (arabic) "تنبيه: هذا الخيار يستبدل كل الأماكن الحالية." else "Warning: this option replaces all current places.",
                             color = MaterialTheme.colorScheme.error,
@@ -872,39 +1087,69 @@ fun ShareAddScreen(
             confirmButton = {
                 Button(
                     onClick = {
-                        val finalImported = jsonToPlacesWithImages(context, pendingImport!!.rawJson)
-
-                        places = when (importMode) {
-                            "replace" -> finalImported
-                            "merge" -> places + finalImported
-                            else -> {
-                                val existingKeys = places.map { placeImportKey(it) }.toMutableSet()
-                                val newItems = finalImported.filter { existingKeys.add(placeImportKey(it)) }
-                                places + newItems
-                            }
-                        }
-
-                        val importedCount = when (importMode) {
-                            "replace" -> finalImported.size
-                            "merge" -> finalImported.size
-                            else -> finalImported.count { placeImportKey(it) !in currentKeys }
-                        }
-
+                        if (busyText != null) return@Button
+                        val confirmedPlan = plan
                         pendingImport = null
-                        message = if (arabic)
-                            "تم تطبيق الاستيراد بنجاح. العناصر المضافة/المطبقة: $importedCount"
-                        else
-                            "Import applied successfully. Added/applied items: $importedCount"
+                        busyText = if (arabic) "جارٍ تطبيق الاستيراد…" else "Applying import…"
+                        busyProgress = ""
+                        scope.launch {
+                            val failure = try {
+                                applyImport(context, confirmedPlan, staged)
+                                null
+                            } catch (e: Exception) {
+                                e
+                            } finally {
+                                busyText = null
+                            }
+
+                            if (failure == null) {
+                                // memory now mirrors exactly what was written
+                                places = confirmedPlan.places
+                                confirmedPlan.categories?.let { categories = it }
+                                confirmedPlan.events?.let { events = it }
+                                confirmedPlan.templates?.let { customTemplates = it }
+                                confirmedPlan.settings?.let { onSettingsImported(it) }
+                                message = if (arabic)
+                                    "تم تطبيق الاستيراد: أُضيف ${confirmedPlan.placesAdded} مكان" + (if (confirmedPlan.placesSkipped > 0) "، وتُخطي ${confirmedPlan.placesSkipped} مكرر" else "") + (if (confirmedPlan.placesRemoved > 0) "، واستُبدل ${confirmedPlan.placesRemoved}" else "") + "، و${confirmedPlan.imagesToCommit.size} صورة" + (if (confirmedPlan.events != null) "، و${confirmedPlan.eventsAdded} مناسبة" else "")
+                                else
+                                    "Import applied: ${confirmedPlan.placesAdded} place(s) added" + (if (confirmedPlan.placesSkipped > 0) ", ${confirmedPlan.placesSkipped} duplicate(s) skipped" else "") + (if (confirmedPlan.placesRemoved > 0) ", ${confirmedPlan.placesRemoved} replaced" else "") + ", ${confirmedPlan.imagesToCommit.size} image(s)" + (if (confirmedPlan.events != null) ", ${confirmedPlan.eventsAdded} event(s)" else "")
+                            } else if (BackupFiles.journal(context).exists()) {
+                                // the journal will finish the import on the next start; block saving until then
+                                importNeedsRestart = true
+                                message = if (arabic)
+                                    "لم يكتمل حفظ الاستيراد. أغلق التطبيق وافتحه من جديد لإكماله تلقائيًا؛ تم إيقاف التعديل حتى ذلك."
+                                else
+                                    "The import could not finish writing. Close and reopen the app to complete it automatically; editing is paused until then."
+                            } else {
+                                message = if (arabic) "فشل الاستيراد ولم يتم تغيير أي بيانات." else "Import failed; no data was changed."
+                            }
+                            Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                        }
                     }
                 ) {
                     Text(if (arabic) "تأكيد الاستيراد" else "Confirm Import")
                 }
             },
             dismissButton = {
-                OutlinedButton(onClick = { pendingImport = null }) {
+                OutlinedButton(onClick = { cancelImport() }) {
                     Text(if (arabic) "إلغاء" else "Cancel")
                 }
             }
+        )
+    }
+
+    if (busyText != null) {
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text(busyText ?: "", fontWeight = FontWeight.SemiBold) },
+            text = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(modifier = Modifier.size(28.dp))
+                    Spacer(Modifier.width(14.dp))
+                    Text(busyProgress.ifBlank { if (arabic) "يرجى الانتظار…" else "Please wait…" })
+                }
+            },
+            confirmButton = {}
         )
     }
 
@@ -1059,7 +1304,7 @@ fun ShareAddScreen(
             pinned = pinned,
             category = category,
             images = images,
-            editing = editingIndex != null,
+            editing = editingPlaceId != null,
             onPlaceNameChange = { placeName = it },
             onTitleChange = { title = it },
             onUrlChange = {
@@ -1087,7 +1332,7 @@ fun ShareAddScreen(
             onManageCategories = { showCategoryManager = true },
             onDismiss = {
                 showAddDialog = false
-                editingIndex = null
+                editingPlaceId = null
             },
             onSave = {
                 val checkedUrl = normalizeMapUrl(url)
@@ -1099,7 +1344,9 @@ fun ShareAddScreen(
                     val fixedUrl = checkedUrl
                     val now = System.currentTimeMillis()
 
+                    val editedPlace = editingPlaceId?.let { id -> places.firstOrNull { it.id == id } }
                     val newPlace = Place(
+                        id = editedPlace?.id ?: editingPlaceId ?: newPlaceId(),
                         placeName = placeName.trim(),
                         title = title.trim(),
                         url = fixedUrl.trim(),
@@ -1111,13 +1358,12 @@ fun ShareAddScreen(
                         rating = rating,
                         favorite = favorite,
                         pinned = pinned,
-                        createdAt = editingIndex?.let { places.getOrNull(it)?.createdAt } ?: now,
+                        createdAt = editedPlace?.createdAt ?: now,
                         updatedAt = now
                     )
 
-                    val index = editingIndex
-                    places = if (index != null && index in places.indices) {
-                        places.mapIndexed { i, place -> if (i == index) newPlace else place }
+                    places = if (editedPlace != null) {
+                        places.map { place -> if (place.id == editedPlace.id) newPlace else place }
                     } else {
                         places + newPlace
                     }
@@ -1133,7 +1379,7 @@ fun ShareAddScreen(
                     images = emptyList()
                     category = categories.firstOrNull() ?: defaultCategories().first()
                     message = ""
-                    editingIndex = null
+                    editingPlaceId = null
                     showAddDialog = false
                 } else {
                     message = if (arabic)
@@ -1157,7 +1403,7 @@ fun ShareAddScreen(
 
     fun openAddDialog() {
         if (storageBlocked()) return
-        editingIndex = null
+        editingPlaceId = null
         placeName = ""
         title = ""
         url = ""
@@ -1178,6 +1424,7 @@ fun ShareAddScreen(
                 DrawerContent(
                     arabic = arabic,
                     currentPage = currentPage,
+                    lastBackupAt = lastBackupAt,
                     onDashboard = {
                         currentPage = ShareAddPage.Dashboard
                         scope.launch { drawerState.close() }
@@ -1326,9 +1573,7 @@ fun ShareAddScreen(
                 }
 
                 if (currentPage == ShareAddPage.SavedLocations) {
-                    items(filtered) { place ->
-                        val realIndex = places.indexOf(place)
-
+                    items(filtered, key = { it.id }) { place ->
                         PlaceCard(
                             place = place,
                             arabic = arabic,
@@ -1346,24 +1591,11 @@ fun ShareAddScreen(
                             },
                             onEdit = {
                                 if (storageBlocked()) return@PlaceCard
-                                if (realIndex >= 0) {
-                                    editingIndex = realIndex
-                                    placeName = place.placeName
-                                    title = place.title
-                                    url = place.url
-                                    desc = place.description
-                                    privateNotes = place.privateNotes
-                                    rating = place.rating
-                                    favorite = place.favorite
-                                    pinned = place.pinned
-                                    images = place.images
-                                    category = Category(place.categoryAr, place.categoryEn)
-                                    showAddDialog = true
-                                }
+                                startEdit(place)
                             },
                             onDelete = {
                                 if (storageBlocked()) return@PlaceCard
-                                if (realIndex >= 0) deleteIndex = realIndex
+                                deletePlaceId = place.id
                             },
                             onCopyLink = {
                                 copyText(context, place.url)
@@ -2076,6 +2308,7 @@ fun EmptyAddressesCard(arabic: Boolean) {
 fun DrawerContent(
     arabic: Boolean,
     currentPage: ShareAddPage,
+    lastBackupAt: Long,
     onDashboard: () -> Unit,
     onSavedLocations: () -> Unit,
     onChangePin: () -> Unit,
@@ -2161,6 +2394,18 @@ fun DrawerContent(
 
         DrawerButton(if (arabic) "☁️ تصدير نسخة احتياطية" else "☁️ Export Backup File", onExport)
         DrawerButton(if (arabic) "📥 استيراد نسخة احتياطية" else "📥 Import Backup File", onImport)
+
+        if (lastBackupAt > 0L) {
+            Text(
+                if (arabic) "آخر تصدير ناجح للملف: ${formatDate(lastBackupAt)}" else "Last successful export: ${formatDate(lastBackupAt)}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.secondary,
+                textAlign = TextAlign.Center,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp)
+            )
+        }
 
         Text(
             if (arabic)
@@ -3641,24 +3886,23 @@ fun PlaceCard(
 }
 
 @Composable
-fun ImagePreview(uri: String, size: Int) {
+fun ImagePreview(uri: String, size: Int, contentDescription: String? = null) {
     val context = LocalContext.current
+    val targetPx = with(LocalDensity.current) { size.dp.roundToPx() }
 
-    val bitmap = remember(uri) {
-        try {
-            openShareAddImageInputStream(context, uri)?.use {
-                BitmapFactory.decodeStream(it)
-            }
-        } catch (_: Exception) {
-            null
+    // PERF-01: decoded off the main thread at display size (cached), not at full resolution
+    val bitmap by produceState(initialValue = ImageThumbnails.cached(uri, targetPx), uri, targetPx) {
+        if (value == null) {
+            value = withContext(Dispatchers.IO) { ImageThumbnails.load(context, uri, targetPx) }
         }
     }
 
-    if (bitmap != null) {
+    val shown = bitmap
+    if (shown != null) {
         Card(shape = RoundedCornerShape(18.dp)) {
             Image(
-                bitmap = bitmap.asImageBitmap(),
-                contentDescription = null,
+                bitmap = shown.asImageBitmap(),
+                contentDescription = contentDescription,
                 modifier = Modifier.size(size.dp),
                 contentScale = ContentScale.Crop
             )
@@ -3824,7 +4068,8 @@ fun loadPlacesChecked(context: Context): StoreLoadResult<List<Place>> {
 
     val parsed = parsePlacesStrict(text)
         ?: return StoreLoadResult(emptyList(), ok = false, recoveryFile = saveRecoveryCopy(context, "places", text))
-    return StoreLoadResult(parsed, ok = true)
+    val ids = assignPlaceIds(parsed)
+    return StoreLoadResult(ids.places, ok = true, generatedIds = ids.generated, repairedIds = ids.repaired)
 }
 
 fun placesToJson(places: List<Place>): String {
@@ -3832,6 +4077,7 @@ fun placesToJson(places: List<Place>): String {
 
     places.forEach { place ->
         val obj = JSONObject()
+        obj.put("id", place.id)
         obj.put("placeName", place.placeName)
         obj.put("title", place.title)
         obj.put("url", place.url)
@@ -3885,6 +4131,7 @@ fun parsePlacesStrict(text: String): List<Place>? {
 
             result.add(
                 Place(
+                    id = obj.optString("id"),
                     placeName = obj.optString("placeName", oldTitle),
                     title = oldTitle,
                     url = obj.optString("url"),
@@ -3909,69 +4156,6 @@ fun parsePlacesStrict(text: String): List<Place>? {
 }
 
 
-fun jsonToPlacesForPreview(text: String): List<Place> {
-    val result = mutableListOf<Place>()
-
-    try {
-        val array = JSONArray(text)
-
-        for (i in 0 until array.length()) {
-            val obj = array.getJSONObject(i)
-            val imageArray = obj.optJSONArray("images") ?: JSONArray()
-            val images = mutableListOf<String>()
-
-            for (j in 0 until imageArray.length()) {
-                val item = imageArray.get(j)
-
-                if (item is JSONObject) {
-                    val oldUri = item.optString("uri", "")
-                    val base64 = item.optString("base64", "")
-
-                    when {
-                        oldUri.isNotBlank() -> images.add(oldUri)
-                        base64.isNotBlank() -> images.add("backup-image")
-                    }
-                } else {
-                    images.add(item.toString())
-                }
-            }
-
-            val oldTitle = obj.optString("title")
-            val categoryAr = obj.optString("categoryAr")
-            val categoryEn = obj.optString("categoryEn")
-
-            val legacyCategory = if (categoryAr.isBlank() || categoryEn.isBlank()) {
-                categoryFromLegacy(obj.optString("category"))
-            } else {
-                Category(categoryAr, categoryEn)
-            }
-
-            val now = System.currentTimeMillis()
-
-            result.add(
-                Place(
-                    placeName = obj.optString("placeName", oldTitle),
-                    title = oldTitle,
-                    url = obj.optString("url"),
-                    description = obj.optString("description"),
-                    privateNotes = obj.optString("privateNotes"),
-                    categoryAr = legacyCategory.ar,
-                    categoryEn = legacyCategory.en,
-                    images = images,
-                    rating = obj.optInt("rating", 0),
-                    favorite = obj.optBoolean("favorite", false),
-                    pinned = obj.optBoolean("pinned", false),
-                    createdAt = obj.optLong("createdAt", now),
-                    updatedAt = obj.optLong("updatedAt", now)
-                )
-            )
-        }
-    } catch (_: Exception) {
-    }
-
-    return result
-}
-
 fun placeImportKey(place: Place): String {
     val cleanUrl = place.url.trim().lowercase()
     if (cleanUrl.isNotBlank()) return "url:$cleanUrl"
@@ -3979,119 +4163,6 @@ fun placeImportKey(place: Place): String {
     val name = place.placeName.ifBlank { place.title }.trim().lowercase()
     val category = "${place.categoryAr}|${place.categoryEn}".trim().lowercase()
     return "place:$name|$category"
-}
-
-fun placesToJsonWithImages(context: Context, places: List<Place>): String {
-    val array = JSONArray()
-
-    places.forEach { place ->
-        val obj = JSONObject()
-        obj.put("placeName", place.placeName)
-        obj.put("title", place.title)
-        obj.put("url", place.url)
-        obj.put("description", place.description)
-        obj.put("privateNotes", place.privateNotes)
-        obj.put("categoryAr", place.categoryAr)
-        obj.put("categoryEn", place.categoryEn)
-        obj.put("rating", place.rating)
-        obj.put("favorite", place.favorite)
-        obj.put("pinned", place.pinned)
-        obj.put("createdAt", place.createdAt)
-        obj.put("updatedAt", place.updatedAt)
-
-        val imageArray = JSONArray()
-
-        place.images.forEach { uriText ->
-            val imageObj = JSONObject()
-            imageObj.put("uri", uriText)
-
-            try {
-                val bytes = openShareAddImageInputStream(context, uriText)?.use {
-                    it.readBytes()
-                }
-
-                if (bytes != null) {
-                    imageObj.put("base64", Base64.encodeToString(bytes, Base64.NO_WRAP))
-                }
-            } catch (_: Exception) {
-            }
-
-            imageArray.put(imageObj)
-        }
-
-        obj.put("images", imageArray)
-        array.put(obj)
-    }
-
-    return array.toString()
-}
-
-fun jsonToPlacesWithImages(context: Context, text: String): List<Place> {
-    val result = mutableListOf<Place>()
-
-    try {
-        val array = JSONArray(text)
-
-        for (i in 0 until array.length()) {
-            val obj = array.getJSONObject(i)
-            val imageArray = obj.optJSONArray("images") ?: JSONArray()
-            val images = mutableListOf<String>()
-
-            for (j in 0 until imageArray.length()) {
-                val item = imageArray.get(j)
-
-                if (item is JSONObject) {
-                    val base64 = item.optString("base64", "")
-                    val oldUri = item.optString("uri", "")
-
-                    if (base64.isNotBlank()) {
-                        val savedImage = saveBase64ImageToPrivateStorage(context, base64)
-                        if (savedImage != null) {
-                            images.add(savedImage)
-                        }
-                    } else if (oldUri.isNotBlank() && isTrustedImageRef(context, oldUri)) {
-                        // SEC-02: a reference from the file is kept only if it is a private-store path or a content:// URI
-                        images.add(oldUri)
-                    }
-                } else if (isTrustedImageRef(context, item.toString())) {
-                    images.add(item.toString())
-                }
-            }
-
-            val oldTitle = obj.optString("title")
-            val categoryAr = obj.optString("categoryAr")
-            val categoryEn = obj.optString("categoryEn")
-
-            val legacyCategory = if (categoryAr.isBlank() || categoryEn.isBlank()) {
-                categoryFromLegacy(obj.optString("category"))
-            } else {
-                Category(categoryAr, categoryEn)
-            }
-
-            val now = System.currentTimeMillis()
-
-            result.add(
-                Place(
-                    placeName = obj.optString("placeName", oldTitle),
-                    title = oldTitle,
-                    url = obj.optString("url"),
-                    description = obj.optString("description"),
-                    privateNotes = obj.optString("privateNotes"),
-                    categoryAr = legacyCategory.ar,
-                    categoryEn = legacyCategory.en,
-                    images = images,
-                    rating = obj.optInt("rating", 0),
-                    favorite = obj.optBoolean("favorite", false),
-                    pinned = obj.optBoolean("pinned", false),
-                    createdAt = obj.optLong("createdAt", now),
-                    updatedAt = obj.optLong("updatedAt", now)
-                )
-            )
-        }
-    } catch (_: Exception) {
-    }
-
-    return result
 }
 
 fun getShareAddImagesDir(context: Context): File {
@@ -4193,36 +4264,6 @@ fun migratePlacesImagesToPrivateStorage(context: Context, places: List<Place>): 
     return ImageMigrationResult(migratedPlaces, changed, failed)
 }
 
-/**
- * Restores one backed-up image into the private store. The bytes must decode as a PNG/JPEG/WebP image;
- * anything else is rejected and the temporary file this call created is removed.
- */
-fun saveBase64ImageToPrivateStorage(context: Context, base64: String): String? {
-    var temp: File? = null
-    return try {
-        val bytes = Base64.decode(base64, Base64.DEFAULT)
-        val extension = detectImageExtension(bytes.copyOfRange(0, minOf(bytes.size, 16))) ?: return null
-        val name = "shareadd_restore_${System.currentTimeMillis()}_${UUID.randomUUID()}"
-        temp = File(getShareAddImagesDir(context), "$name.part")
-        temp.outputStream().use { it.write(bytes) }
-
-        if (!isDecodableImage(temp)) {
-            temp.delete()
-            return null
-        }
-
-        val imageFile = File(getShareAddImagesDir(context), "$name.$extension")
-        if (!temp.renameTo(imageFile)) {
-            temp.delete()
-            return null
-        }
-        imageFile.absolutePath
-    } catch (_: Exception) {
-        temp?.delete()
-        null
-    }
-}
-
 /** SEC-02: opens only trusted image references (private store files, or content:// URIs). */
 fun openShareAddImageInputStream(context: Context, imageRef: String) = try {
     if (!isTrustedImageRef(context, imageRef)) {
@@ -4263,3 +4304,22 @@ fun shareAddImageUri(context: Context, imageRef: String): Uri? {
         null
     }
 }
+
+fun appVersionName(context: Context): String = try {
+    context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: ""
+} catch (_: Exception) {
+    ""
+}
+
+fun appVersionCode(context: Context): Long = try {
+    context.packageManager.getPackageInfo(context.packageName, 0).longVersionCode
+} catch (_: Exception) {
+    0L
+}
+
+fun saveLastBackup(context: Context, time: Long) {
+    context.getSharedPreferences("shareadd_settings", Context.MODE_PRIVATE).edit().putLong("lastBackupAt", time).apply()
+}
+
+fun loadLastBackup(context: Context): Long =
+    context.getSharedPreferences("shareadd_settings", Context.MODE_PRIVATE).getLong("lastBackupAt", 0L)

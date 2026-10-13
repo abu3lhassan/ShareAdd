@@ -9,7 +9,11 @@ import java.io.File
 data class StoreLoadResult<T>(
     val value: T,
     val ok: Boolean,
-    val recoveryFile: String? = null
+    val recoveryFile: String? = null,
+    /** places: ids generated for older records */
+    val generatedIds: Int = 0,
+    /** places: duplicate ids that were given a new id */
+    val repairedIds: Int = 0
 )
 
 /**
