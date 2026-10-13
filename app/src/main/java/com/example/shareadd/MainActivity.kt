@@ -91,6 +91,15 @@ import com.example.shareadd.backup.exportBackup
 import com.example.shareadd.backup.planForPreview
 import com.example.shareadd.backup.readBackupForPreview
 import com.example.shareadd.events.InvitationTemplate
+import com.example.shareadd.events.EventEditorDialog
+import com.example.shareadd.events.EventTypes
+import com.example.shareadd.events.InvitationPreviewDialog
+import com.example.shareadd.events.PlaceQrDialog
+import com.example.shareadd.events.ShareEventSaver
+import com.example.shareadd.events.TemplateManagerDialog
+import com.example.shareadd.events.defaultTemplateFor
+import com.example.shareadd.events.eventsPageItems
+import com.example.shareadd.events.newEventId
 import com.example.shareadd.events.ShareEvent
 import com.example.shareadd.events.loadEventsChecked
 import com.example.shareadd.events.loadTemplatesChecked
@@ -130,7 +139,8 @@ data class PendingImport(
 
 enum class ShareAddPage {
     Dashboard,
-    SavedLocations
+    SavedLocations,
+    Events
 }
 
 /** LIFE-01 / SEC-01: unlocked state kept across configuration changes only (a ViewModel does not survive process death). */
@@ -624,8 +634,15 @@ fun ShareAddScreen(
     var showCategoryManager by remember { mutableStateOf(false) }
     var showPinChange by remember { mutableStateOf(false) }
     var showAboutDialog by remember { mutableStateOf(false) }
+    // Events & Invitations
+    var editingEvent by rememberSaveable(stateSaver = ShareEventSaver) { mutableStateOf<ShareEvent?>(null) }
+    var editingEventIsNew by rememberSaveable { mutableStateOf(false) }
+    var previewEventId by rememberSaveable { mutableStateOf<String?>(null) }
+    var deleteEventId by rememberSaveable { mutableStateOf<String?>(null) }
+    var showTemplateManager by rememberSaveable { mutableStateOf(false) }
+    var qrPlaceId by rememberSaveable { mutableStateOf<String?>(null) }
     var showImportNotice by remember { mutableStateOf(false) }
-    var currentPage by remember { mutableStateOf(ShareAddPage.Dashboard) }
+    var currentPage by rememberSaveable { mutableStateOf(ShareAddPage.Dashboard) }
     var pendingImport by remember { mutableStateOf<PendingImport?>(null) }
     var importMode by remember { mutableStateOf(ImportMode.SKIP_DUPLICATES) }
     var detailsPlace by remember { mutableStateOf<Place?>(null) }
@@ -931,7 +948,86 @@ fun ShareAddScreen(
             onShareImages = {
                 sharePlace(context, shareOptionsPlace!!, arabic, includeImages = true, detailed = true)
                 shareOptionsPlace = null
+            },
+            onShowQr = {
+                qrPlaceId = shareOptionsPlace!!.id
+                shareOptionsPlace = null
             }
+        )
+    }
+
+    qrPlaceId?.let { id ->
+        val place = places.firstOrNull { it.id == id }
+        if (place == null) {
+            qrPlaceId = null
+        } else {
+            PlaceQrDialog(
+                arabic = arabic,
+                link = place.url,
+                shareTextValue = buildShareText(place, arabic, detailed = true),
+                onClose = { qrPlaceId = null }
+            )
+        }
+    }
+
+    editingEvent?.let { draftEvent ->
+        EventEditorDialog(
+            arabic = arabic,
+            initial = draftEvent,
+            isNew = editingEventIsNew,
+            places = places,
+            customTemplates = customTemplates,
+            onDismiss = { editingEvent = null },
+            onSave = { saved ->
+                events = if (events.any { it.id == saved.id }) events.map { if (it.id == saved.id) saved else it } else events + saved
+                editingEvent = null
+                message = if (arabic) "تم حفظ المناسبة" else "Event saved"
+            }
+        )
+    }
+
+    previewEventId?.let { id ->
+        val event = events.firstOrNull { it.id == id }
+        if (event == null) {
+            previewEventId = null
+        } else {
+            InvitationPreviewDialog(
+                arabic = arabic,
+                event = event,
+                places = places,
+                customTemplates = customTemplates,
+                onClose = { previewEventId = null },
+                onUpdateEvent = { updated -> events = events.map { if (it.id == updated.id) updated else it } }
+            )
+        }
+    }
+
+    deleteEventId?.let { id ->
+        AlertDialog(
+            onDismissRequest = { deleteEventId = null },
+            title = { Text(if (arabic) "حذف المناسبة؟" else "Delete event?") },
+            text = { Text(if (arabic) "سيتم حذف هذه المناسبة ونص دعوتها. لن يتأثر الموقع المحفوظ." else "This event and its invitation text will be deleted. The saved place is not affected.") },
+            confirmButton = {
+                Button(onClick = {
+                    events = events.filterNot { it.id == id }
+                    deleteEventId = null
+                }) { Text(if (arabic) "حذف" else "Delete") }
+            },
+            dismissButton = {
+                OutlinedButton(onClick = { deleteEventId = null }) { Text(if (arabic) "إلغاء" else "Cancel") }
+            }
+        )
+    }
+
+    if (showTemplateManager) {
+        TemplateManagerDialog(
+            arabic = arabic,
+            customTemplates = customTemplates,
+            onSaveTemplate = { t ->
+                customTemplates = if (customTemplates.any { it.id == t.id }) customTemplates.map { if (it.id == t.id) t else it } else customTemplates + t
+            },
+            onDeleteTemplate = { t -> customTemplates = customTemplates.filterNot { it.id == t.id } },
+            onClose = { showTemplateManager = false }
         )
     }
 
@@ -1550,6 +1646,10 @@ fun ShareAddScreen(
                         currentPage = ShareAddPage.Dashboard
                         scope.launch { drawerState.close() }
                     },
+                    onEvents = {
+                        currentPage = ShareAddPage.Events
+                        scope.launch { drawerState.close() }
+                    },
                     onSavedLocations = {
                         currentPage = ShareAddPage.SavedLocations
                         scope.launch { drawerState.close() }
@@ -1630,7 +1730,7 @@ fun ShareAddScreen(
                             onAdd = { openAddDialog() },
                             onOpenSavedLocations = { currentPage = ShareAddPage.SavedLocations }
                         )
-                    } else {
+                    } else if (currentPage == ShareAddPage.SavedLocations) {
                         SavedLocationsHeader(
                             arabic = arabic,
                             search = search,
@@ -1691,6 +1791,43 @@ fun ShareAddScreen(
                             Spacer(Modifier.height(10.dp))
                         }
                     }
+                }
+
+                if (currentPage == ShareAddPage.Events) {
+                    eventsPageItems(
+                        arabic = arabic,
+                        events = events,
+                        places = places,
+                        onNewEvent = {
+                            if (!storageBlocked()) {
+                                val now = System.currentTimeMillis()
+                                editingEventIsNew = true
+                                editingEvent = ShareEvent(
+                                    id = newEventId(),
+                                    type = EventTypes.GENERAL,
+                                    templateId = defaultTemplateFor(EventTypes.GENERAL),
+                                    language = if (arabic) "ar" else "en",
+                                    createdAt = 0L,
+                                    updatedAt = now
+                                )
+                            }
+                        },
+                        onManageTemplates = { if (!storageBlocked()) showTemplateManager = true },
+                        onPreview = { previewEventId = it.id },
+                        onEdit = {
+                            if (!storageBlocked()) {
+                                editingEventIsNew = false
+                                editingEvent = it
+                            }
+                        },
+                        onDuplicate = {
+                            if (!storageBlocked()) {
+                                editingEventIsNew = true
+                                editingEvent = it.copy(id = newEventId(), createdAt = 0L, updatedAt = System.currentTimeMillis())
+                            }
+                        },
+                        onDelete = { if (!storageBlocked()) deleteEventId = it.id }
+                    )
                 }
 
                 if (currentPage == ShareAddPage.SavedLocations) {
@@ -2442,6 +2579,7 @@ fun DrawerContent(
     lastBackupAt: Long,
     onDashboard: () -> Unit,
     onSavedLocations: () -> Unit,
+    onEvents: () -> Unit,
     onChangePin: () -> Unit,
     onCategories: () -> Unit,
     onAbout: () -> Unit,
@@ -2508,6 +2646,11 @@ fun DrawerContent(
             text = if (arabic) "📍 المواقع المحفوظة" else "📍 Saved Locations",
             selected = currentPage == ShareAddPage.SavedLocations,
             onClick = onSavedLocations
+        )
+        DrawerButton(
+            text = if (arabic) "🎟️ المناسبات والدعوات" else "🎟️ Events & Invitations",
+            selected = currentPage == ShareAddPage.Events,
+            onClick = onEvents
         )
         DrawerButton(if (arabic) "🗂️ التصنيفات" else "🗂️ Categories", onCategories)
         DrawerButton(if (arabic) "🔐 تغيير الرمز" else "🔐 Change PIN", onChangePin)
@@ -3799,7 +3942,8 @@ fun ShareOptionsDialog(
     onShortShare: () -> Unit,
     onDetailedShare: () -> Unit,
     onCopyText: () -> Unit,
-    onShareImages: () -> Unit
+    onShareImages: () -> Unit,
+    onShowQr: () -> Unit
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -3873,6 +4017,13 @@ fun ShareOptionsDialog(
                         ) {
                             Text(if (arabic) "مشاركة مع الصور" else "Share With Images")
                         }
+                    }
+
+                    OutlinedButton(
+                        onClick = onShowQr,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(if (arabic) "رمز QR للرابط" else "QR Code for the Link")
                     }
                 }
             }
