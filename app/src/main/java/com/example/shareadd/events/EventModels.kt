@@ -60,6 +60,11 @@ data class ShareEvent(
     val invitationText: String = "",
     /** true when the user edited the invitation text by hand */
     val textEdited: Boolean = false,
+    /**
+     * Preferred house/place photo for sharing: one of the linked place's image references, exactly as stored in the
+     * place (never a copy, bitmap or base64). Empty = no preference. Checked against the trusted image store when used.
+     */
+    val invitationPhoto: String = "",
     val createdAt: Long = 0L,
     val updatedAt: Long = 0L
 )
@@ -100,6 +105,7 @@ fun writeEvent(out: JsonOut, e: ShareEvent) {
     out.field("language", e.language)
     out.field("invitationText", e.invitationText)
     out.field("textEdited", e.textEdited)
+    if (e.invitationPhoto.isNotBlank()) out.field("invitationPhoto", e.invitationPhoto)
     out.field("createdAt", e.createdAt)
     out.field("updatedAt", e.updatedAt)
     out.endObject()
@@ -127,6 +133,7 @@ fun readEvent(input: JsonIn): ShareEvent {
             "language" -> e = e.copy(language = input.nextScalarAsText())
             "invitationText" -> e = e.copy(invitationText = input.nextScalarAsText())
             "textEdited" -> e = e.copy(textEdited = input.nextScalarAsText() == "true")
+            "invitationPhoto" -> e = e.copy(invitationPhoto = input.nextScalarAsText())
             "createdAt" -> e = e.copy(createdAt = input.nextLong())
             "updatedAt" -> e = e.copy(updatedAt = input.nextLong())
             else -> input.skipValue()

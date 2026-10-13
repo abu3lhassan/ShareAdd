@@ -1,11 +1,15 @@
 package com.example.shareadd.events
 
+import android.content.ClipData
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.widget.Toast
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -13,6 +17,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -28,6 +33,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.DatePicker
 import androidx.compose.material3.DatePickerDialog
 import androidx.compose.material3.DropdownMenu
@@ -48,24 +54,37 @@ import androidx.compose.material3.rememberTimePickerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDirection
 import androidx.compose.ui.unit.dp
+import androidx.core.content.FileProvider
+import com.example.shareadd.ImagePreview
+import com.example.shareadd.ImageThumbnails
 import com.example.shareadd.Place
 import com.example.shareadd.copyText
+import com.example.shareadd.isShareAddPrivateImage
+import com.example.shareadd.isTrustedImageRef
 import com.example.shareadd.normalizeMapUrl
+import com.example.shareadd.shareAddImageUri
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
@@ -380,7 +399,8 @@ fun EventEditorDialog(
                                 DropdownMenuItem(
                                     text = { Text(if (p.title.isNotBlank()) "${p.placeName} — ${p.title}" else p.placeName) },
                                     onClick = {
-                                        draft = draft.copy(placeId = p.id, place = snapshotOf(p))
+                                        // the remembered house photo belongs to the previous place
+                                        draft = draft.copy(placeId = p.id, place = snapshotOf(p), invitationPhoto = if (p.id == draft.placeId) draft.invitationPhoto else "")
                                         showPlaceMenu = false
                                     }
                                 )
@@ -619,6 +639,63 @@ fun QrPreview(arabic: Boolean, link: String, sizeDp: Int = 200): Boolean {
     return true
 }
 
+/**
+ * Shares the invitation text with the chosen attachments: the house photo and/or the QR image (both as FileProvider /
+ * trusted content URIs). Text only → ACTION_SEND text; one image → ACTION_SEND; photo + QR → ACTION_SEND_MULTIPLE.
+ */
+fun shareInvitation(context: Context, text: String, photoUri: Uri?, qrFile: File?, chooserTitle: String) {
+    val uris = ArrayList<Uri>()
+    photoUri?.let { uris.add(it) }
+    qrFile?.let { uris.add(FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", it)) }
+    if (uris.isEmpty()) {
+        shareText(context, text, chooserTitle)
+        return
+    }
+    val intent = if (uris.size == 1) {
+        Intent(Intent.ACTION_SEND).apply { putExtra(Intent.EXTRA_STREAM, uris[0]) }
+    } else {
+        Intent(Intent.ACTION_SEND_MULTIPLE).apply { putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris) }
+    }
+    intent.type = "image/*"
+    if (text.isNotBlank()) intent.putExtra(Intent.EXTRA_TEXT, text)
+    val clip = ClipData.newRawUri("ShareAdd", uris[0])
+    uris.drop(1).forEach { clip.addItem(ClipData.Item(it)) }
+    intent.clipData = clip
+    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    context.startActivity(Intent.createChooser(intent, chooserTitle))
+}
+
+/** The selected house photo, shown whole (not cropped), decoded off the main thread at display size. */
+@Composable
+private fun HousePhotoPreview(ref: String, description: String) {
+    val context = LocalContext.current
+    val targetPx = with(LocalDensity.current) { 200.dp.roundToPx() }
+    val bitmap by produceState(initialValue = ImageThumbnails.cached(ref, targetPx), ref, targetPx) {
+        if (value == null) value = withContext(Dispatchers.IO) { ImageThumbnails.load(context, ref, targetPx) }
+    }
+    val shown = bitmap ?: return
+    Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+        Image(
+            bitmap = shown.asImageBitmap(),
+            contentDescription = description,
+            modifier = Modifier.heightIn(max = 180.dp).clip(RoundedCornerShape(16.dp)),
+            contentScale = ContentScale.Fit
+        )
+    }
+}
+
+@Composable
+private fun CheckRow(checked: Boolean, enabled: Boolean = true, label: String, onChange: (Boolean) -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth().clickable(enabled = enabled) { onChange(!checked) },
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Checkbox(checked = checked, onCheckedChange = if (enabled) onChange else null, enabled = enabled)
+        Text(label, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun InvitationPreviewDialog(
     arabic: Boolean,
@@ -629,15 +706,66 @@ fun InvitationPreviewDialog(
     onUpdateEvent: (ShareEvent) -> Unit
 ) {
     val context = LocalContext.current
+    val uiLang = if (arabic) "ar" else "en"
     var confirmRegenerate by remember { mutableStateOf(false) }
     val link = placeLinkState(event, places)
-    val text = event.invitationText
     val chooser = if (arabic) "مشاركة الدعوة عبر" else "Share invitation with"
+    val isPrayer = event.type == EventTypes.PRAYER
+
+    // ---- share session: values for this share only; the saved event is not changed by them
+    var sessionTime by rememberSaveable(event.id) { mutableStateOf(event.time) }
+    var sessionOpening by rememberSaveable(event.id) { mutableStateOf(event.openingTime) }
+    var updateEventTimes by rememberSaveable(event.id) { mutableStateOf(false) }
+    var includePhoto by rememberSaveable(event.id) { mutableStateOf(true) }
+    var includeQr by rememberSaveable(event.id) { mutableStateOf(false) }
+    var pickTimeFor by rememberSaveable(event.id) { mutableStateOf<String?>(null) } // "time" or "opening"
+    var showPhotoPicker by rememberSaveable(event.id) { mutableStateOf(false) }
+
+    val times = ShareTimes(sessionTime, sessionOpening)
+    val timesChanged = times != savedTimes(event)
+    val templateBody = templateChoices(customTemplates, event.language, arabic).firstOrNull { it.id == event.templateId }?.body
+    val shareTextResult = shareInvitationText(event, times, templateBody)
+    val text = shareTextResult.text
+
+    // ---- house photo: one of the linked place's own images (trusted store / readable legacy URI)
+    val linkedPlace = event.placeId?.let { id -> places.firstOrNull { it.id == id } }
+    val photoChoice = invitationPhotoChoice(
+        event,
+        linkedPlace,
+        usablePlaceImage = { ref -> isTrustedImageRef(context, ref) && (!File(ref).isAbsolute || File(ref).exists()) },
+        usableOrphanImage = { ref -> isShareAddPrivateImage(context, ref) }
+    )
+    val selectedPhoto = photoChoice.selected
+    val photoToShare = if (includePhoto) selectedPhoto else null
+
+    val qrLink = normalizeMapUrl(event.place.url)
+    val qrToShare = includeQr && qrLink != null
 
     fun regenerate(e: ShareEvent): ShareEvent? {
         val choice = templateChoices(customTemplates, e.language, arabic).firstOrNull { it.id == e.templateId } ?: return null
         return e.copy(invitationText = renderEvent(e, choice.body).text, textEdited = false, updatedAt = System.currentTimeMillis())
     }
+
+    /**
+     * Saved only through a share/copy action, in one update:
+     *  - the session times, when "update the event with these times" is ticked (never otherwise);
+     *  - the house photo actually shared, so the event remembers it (the place photo itself is untouched).
+     */
+    fun saveShareChoices(sharedPhoto: String?) {
+        val now = System.currentTimeMillis()
+        var updated = event
+        val saveTimes = updateEventTimes && timesChanged
+        if (saveTimes) updated = applyShareTimes(updated, times, shareTextResult, now)
+        if (sharedPhoto != null && sharedPhoto != event.invitationPhoto) updated = updated.copy(invitationPhoto = sharedPhoto, updatedAt = now)
+        if (updated == event) return
+        onUpdateEvent(updated)
+        if (saveTimes) {
+            updateEventTimes = false
+            Toast.makeText(context, if (arabic) "تم تحديث أوقات المناسبة" else "Event times updated", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun timeLabel(value: String) = formatEventTime(value, uiLang)
 
     AlertDialog(
         onDismissRequest = onClose,
@@ -671,6 +799,131 @@ fun InvitationPreviewDialog(
                         modifier = Modifier.fillMaxWidth()
                     ) { Text(if (arabic) "تحديث بيانات الموقع من العنوان المحفوظ" else "Update place details from the saved place") }
                 }
+
+                // ---- times for this share
+                Surface(
+                    shape = RoundedCornerShape(18.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f)
+                ) {
+                    Column(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(if (arabic) "أوقات هذه المشاركة" else "Times for this share", fontWeight = FontWeight.SemiBold)
+                        OutlinedButton(onClick = { pickTimeFor = "time" }, modifier = Modifier.fillMaxWidth()) {
+                            Text(
+                                (if (isPrayer) if (arabic) "⏰ وقت الصلاة: " else "⏰ Prayer time: " else if (arabic) "⏰ الوقت: " else "⏰ Time: ") +
+                                    timeLabel(sessionTime).ifBlank { if (arabic) "اختيار" else "Choose" },
+                                maxLines = 1
+                            )
+                        }
+                        OutlinedButton(onClick = { pickTimeFor = "opening" }, modifier = Modifier.fillMaxWidth()) {
+                            Text(
+                                if (sessionOpening.isBlank()) if (arabic) "🚪 فتح الباب (اختياري)" else "🚪 Doors open (optional)"
+                                else (if (arabic) "🚪 فتح الباب: " else "🚪 Doors open: ") + timeLabel(sessionOpening),
+                                maxLines = 1
+                            )
+                        }
+                        if (sessionOpening.isNotBlank()) {
+                            TextButton(onClick = { sessionOpening = "" }) { Text(if (arabic) "مسح وقت فتح الباب" else "Clear doors-open time") }
+                        }
+                        if (timesChanged) {
+                            Text(
+                                (if (arabic) "لهذه المشاركة فقط. المحفوظ في المناسبة: " else "For this share only. Saved in the event: ") +
+                                    listOf(timeLabel(event.time), timeLabel(event.openingTime).let { if (it.isBlank()) "" else (if (arabic) "فتح الباب " else "doors ") + it })
+                                        .filter { it.isNotBlank() }.joinToString(" — ").ifBlank { "—" },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            CheckRow(
+                                checked = updateEventTimes,
+                                label = if (arabic) "تحديث المناسبة بهذه الأوقات" else "Update the event with these times",
+                                onChange = { updateEventTimes = it }
+                            )
+                            TextButton(onClick = { sessionTime = event.time; sessionOpening = event.openingTime; updateEventTimes = false }) {
+                                Text(if (arabic) "الرجوع للأوقات المحفوظة" else "Back to saved times")
+                            }
+                        }
+                        when (shareTextResult.source) {
+                            ShareTextSource.TIMES_REPLACED -> Text(
+                                if (arabic) "نصك معدّل يدويًا؛ استُبدل الوقت فيه لهذه المشاركة فقط." else "Your text is hand-edited; the time in it was replaced for this share only.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.secondary
+                            )
+                            ShareTextSource.TIMES_NOT_APPLIED -> Text(
+                                if (arabic) "نصك معدّل يدويًا ولا يمكن وضع الأوقات الجديدة فيه بأمان؛ سيُشارك كما هو. عدّله من «تعديل» إن لزم."
+                                else "Your text is hand-edited and the new times cannot be placed in it safely; it is shared as it is. Change it from Edit if needed.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            else -> {}
+                        }
+                    }
+                }
+
+                // ---- house photo
+                Surface(
+                    shape = RoundedCornerShape(18.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f)
+                ) {
+                    Column(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(if (arabic) "📷 صورة المنزل" else "📷 House photo", fontWeight = FontWeight.SemiBold)
+                        if (photoChoice.previousUnavailable) {
+                            Text(
+                                if (arabic) "صورة الدعوة المختارة سابقًا لم تعد متاحة. اختر صورة أخرى أو شارك بدون صورة."
+                                else "The invitation photo chosen before is no longer available. Choose another photo or share without one.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                        if (photoChoice.available.isEmpty()) {
+                            if (!photoChoice.previousUnavailable) {
+                                Text(
+                                    if (linkedPlace == null && event.placeId != null)
+                                        if (arabic) "الموقع المرتبط محذوف ولا توجد صورة محفوظة لهذه الدعوة." else "The linked place was deleted and this invitation has no saved photo."
+                                    else if (arabic) "لا توجد صور محفوظة لهذا الموقع." else "This place has no saved photos.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        } else {
+                            if (selectedPhoto != null) {
+                                CheckRow(
+                                    checked = includePhoto,
+                                    label = if (arabic) "إرفاق صورة المنزل" else "Attach the house photo",
+                                    onChange = { includePhoto = it }
+                                )
+                                if (includePhoto) HousePhotoPreview(selectedPhoto, if (arabic) "صورة المنزل المختارة" else "Selected house photo")
+                            }
+                            if (linkedPlace != null) {
+                                OutlinedButton(onClick = { showPhotoPicker = true }, modifier = Modifier.fillMaxWidth()) {
+                                    Text(
+                                        if (selectedPhoto == null) if (arabic) "اختيار صورة (${photoChoice.available.size})" else "Choose a photo (${photoChoice.available.size})"
+                                        else if (arabic) "تغيير الصورة (${photoChoice.available.size})" else "Change photo (${photoChoice.available.size})"
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ---- QR
+                Surface(
+                    shape = RoundedCornerShape(18.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f)
+                ) {
+                    Column(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        CheckRow(
+                            checked = qrToShare,
+                            enabled = qrLink != null,
+                            label = if (arabic) "إرفاق رمز QR لرابط الموقع" else "Attach the QR code of the place link",
+                            onChange = { includeQr = it }
+                        )
+                        if (qrLink == null || includeQr) QrPreview(arabic, event.place.url, 160)
+                    }
+                }
+
+                // ---- the invitation exactly as it will be shared
+                Text(if (arabic) "نص الدعوة" else "Invitation text", fontWeight = FontWeight.SemiBold)
                 Surface(
                     shape = RoundedCornerShape(18.dp),
                     color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f),
@@ -680,30 +933,42 @@ fun InvitationPreviewDialog(
                         Text(text, modifier = Modifier.fillMaxWidth().padding(14.dp), style = LocalTextStyle.current.copy(textDirection = TextDirection.Content))
                     }
                 }
-                Text(if (arabic) "رمز QR لرابط الموقع" else "QR code for the place link", fontWeight = FontWeight.SemiBold)
-                val hasQr = QrPreview(arabic, event.place.url, 180)
 
-                Button(onClick = { shareText(context, text, chooser) }, modifier = Modifier.fillMaxWidth()) {
-                    Text(if (arabic) "مشاركة النص والرابط" else "Share text & link")
-                }
-                if (hasQr) {
+                val parts = listOfNotNull(
+                    if (arabic) "النص" else "text",
+                    if (photoToShare != null) if (arabic) "صورة المنزل" else "house photo" else null,
+                    if (qrToShare) if (arabic) "رمز QR" else "QR code" else null
+                )
+                Text(
+                    (if (arabic) "سيُرسل: " else "Will send: ") + parts.joinToString(" + "),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Button(
+                    onClick = {
+                        val photoUri = photoToShare?.let { shareAddImageUri(context, it) }
+                        if (photoToShare != null && photoUri == null) {
+                            Toast.makeText(
+                                context,
+                                if (arabic) "تعذر إرفاق صورة المنزل؛ ستُشارك الدعوة بدونها" else "The house photo could not be attached; sharing without it",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                        val qrFile = if (qrToShare) QrCodes.savePng(context, qrLink!!) else null
+                        saveShareChoices(if (photoUri != null) photoToShare else null)
+                        shareInvitation(context, text, photoUri, qrFile, chooser)
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text(if (arabic) "مشاركة الدعوة" else "Share invitation") }
+                if (qrLink != null) {
                     OutlinedButton(
-                        onClick = {
-                            val file = QrCodes.savePng(context, normalizeMapUrl(event.place.url)!!)
-                            QrCodes.share(context, file, text, chooser)
-                        },
-                        modifier = Modifier.fillMaxWidth()
-                    ) { Text(if (arabic) "مشاركة النص مع رمز QR" else "Share text with QR") }
-                    OutlinedButton(
-                        onClick = {
-                            val file = QrCodes.savePng(context, normalizeMapUrl(event.place.url)!!)
-                            QrCodes.share(context, file, null, chooser)
-                        },
+                        onClick = { QrCodes.share(context, QrCodes.savePng(context, qrLink), null, chooser) },
                         modifier = Modifier.fillMaxWidth()
                     ) { Text(if (arabic) "مشاركة رمز QR كصورة" else "Share QR image") }
                 }
                 OutlinedButton(
                     onClick = {
+                        saveShareChoices(null)
                         copyText(context, text)
                         Toast.makeText(context, if (arabic) "تم نسخ نص الدعوة" else "Invitation text copied", Toast.LENGTH_SHORT).show()
                     },
@@ -717,6 +982,69 @@ fun InvitationPreviewDialog(
         confirmButton = {},
         dismissButton = { TextButton(onClick = onClose) { Text(if (arabic) "إغلاق" else "Close") } }
     )
+
+    pickTimeFor?.let { which ->
+        val current = if (which == "opening") sessionOpening.ifBlank { sessionTime } else sessionTime
+        val (h, m) = current.split(":").mapNotNull { it.toIntOrNull() }.let { if (it.size == 2) it[0] to it[1] else 18 to 0 }
+        val state = rememberTimePickerState(initialHour = h, initialMinute = m, is24Hour = false)
+        AlertDialog(
+            onDismissRequest = { pickTimeFor = null },
+            title = {
+                Text(
+                    if (which == "opening") if (arabic) "وقت فتح الباب" else "Doors open"
+                    else if (isPrayer) if (arabic) "وقت الصلاة" else "Prayer time"
+                    else if (arabic) "الوقت" else "Time"
+                )
+            },
+            text = { TimePicker(state = state) },
+            confirmButton = {
+                TextButton(onClick = {
+                    val value = "%02d:%02d".format(Locale.ROOT, state.hour, state.minute)
+                    if (which == "opening") sessionOpening = value else sessionTime = value
+                    pickTimeFor = null
+                }) { Text(if (arabic) "تم" else "OK") }
+            },
+            dismissButton = { TextButton(onClick = { pickTimeFor = null }) { Text(if (arabic) "إلغاء" else "Cancel") } }
+        )
+    }
+
+    if (showPhotoPicker) {
+        AlertDialog(
+            onDismissRequest = { showPhotoPicker = false },
+            title = { Text(if (arabic) "اختيار صورة المنزل" else "Choose the house photo") },
+            text = {
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    items(photoChoice.available.size) { index ->
+                        val ref = photoChoice.available[index]
+                        val isSelected = ref == selectedPhoto
+                        Box(
+                            modifier = Modifier
+                                .border(
+                                    width = if (isSelected) 3.dp else 1.dp,
+                                    color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline,
+                                    shape = RoundedCornerShape(20.dp)
+                                )
+                                .padding(4.dp)
+                                .clickable {
+                                    // remembered for this event (an explicit choice), the place photo itself is untouched
+                                    onUpdateEvent(event.copy(invitationPhoto = ref, updatedAt = System.currentTimeMillis()))
+                                    includePhoto = true
+                                    showPhotoPicker = false
+                                }
+                        ) {
+                            ImagePreview(
+                                ref,
+                                96,
+                                if (arabic) "صورة المكان ${index + 1} من ${photoChoice.available.size}" else "Place photo ${index + 1} of ${photoChoice.available.size}"
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = { TextButton(onClick = { showPhotoPicker = false }) { Text(if (arabic) "إلغاء" else "Cancel") } }
+        )
+    }
 
     if (confirmRegenerate) {
         AlertDialog(

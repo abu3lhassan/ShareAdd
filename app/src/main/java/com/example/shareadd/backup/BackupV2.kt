@@ -188,7 +188,8 @@ class BackupException(val problem: BackupProblem, message: String, val version: 
 
 sealed class StagedImage {
     /** image bytes decoded and validated into the staging folder */
-    data class Embedded(val file: File, val extension: String) : StagedImage()
+    /** [originalName] = the file name the image had on the exporting device (used only to match event photo preferences) */
+    data class Embedded(val file: File, val extension: String, val originalName: String = "") : StagedImage()
     /** legacy reference (content://) kept as it was, without image bytes */
     data class LegacyRef(val ref: String) : StagedImage()
 }
@@ -458,7 +459,7 @@ private fun readV1Image(json: JsonIn, ctx: StageContext): StagedImage? {
         val bytes = try { Base64.getMimeDecoder().decode(base64) } catch (_: IllegalArgumentException) { null }
         if (bytes == null) { ctx.rejected++; return null }
         file.writeBytes(bytes)
-        return finishStagedFile(file, ctx)
+        return finishStagedFile(file, ctx, if (uri.isNotBlank()) File(uri).name else "")
     }
     return if (uri.isNotBlank()) legacyRef(uri, ctx) else null
 }
@@ -471,6 +472,7 @@ private fun readV2Image(json: JsonIn, ctx: StageContext): StagedImage? {
     var expectedSha: String? = null
     var expectedSize = -1L
     var hasData = false
+    var originalName = ""
     val decoder = Base64.getDecoder()
 
     json.beginObject()
@@ -490,6 +492,7 @@ private fun readV2Image(json: JsonIn, ctx: StageContext): StagedImage? {
                     json.endArray()
                 }
                 "sha256" -> expectedSha = json.nextScalarAsText().lowercase()
+                "name" -> originalName = json.nextScalarAsText()
                 "size" -> expectedSize = json.nextLong()
                 else -> json.skipValue()
             }
@@ -503,10 +506,10 @@ private fun readV2Image(json: JsonIn, ctx: StageContext): StagedImage? {
         file.delete()
         throw BackupException(BackupProblem.IMAGE_CHECK_FAILED, "image data does not match its checksum")
     }
-    return finishStagedFile(file, ctx)
+    return finishStagedFile(file, ctx, originalName)
 }
 
-private fun finishStagedFile(file: File, ctx: StageContext): StagedImage? {
+private fun finishStagedFile(file: File, ctx: StageContext, originalName: String): StagedImage? {
     val ext = ctx.validateImage(file)
     if (ext == null) {
         file.delete()
@@ -521,7 +524,7 @@ private fun finishStagedFile(file: File, ctx: StageContext): StagedImage? {
     }
     ctx.embedded++
     ctx.onProgress(ctx.embedded)
-    return StagedImage.Embedded(finalFile, ext)
+    return StagedImage.Embedded(finalFile, ext, File(originalName).name)
 }
 
 private fun legacyRef(ref: String, ctx: StageContext): StagedImage? {
@@ -605,18 +608,26 @@ fun planImport(
     originalIds.forEachIndexed { i, original -> if (original.isNotEmpty() && original !in fileIdToAssigned) fileIdToAssigned[original] = fileAssigned[i].id }
 
     var imageSeq = 0
+    // final place id -> (image file name on the exporting device -> image reference after import), for event photos
+    val imageNamesByPlace = HashMap<String, Map<String, String>>()
     fun materialize(index: Int, place: Place): Pair<Place, List<Pair<File, String>>> {
         val commits = mutableListOf<Pair<File, String>>()
+        val names = HashMap<String, String>()
         val refs = staged.places[index].images.map { img ->
             when (img) {
                 is StagedImage.Embedded -> {
                     val target = File(imagesDir, "shareadd_restore_${now}_${++imageSeq}_${UUID.randomUUID()}.${img.extension}").absolutePath
                     commits.add(img.file to target)
+                    if (img.originalName.isNotBlank()) names.putIfAbsent(img.originalName, target)
                     target
                 }
-                is StagedImage.LegacyRef -> img.ref
+                is StagedImage.LegacyRef -> {
+                    File(img.ref).name.takeIf { it.isNotBlank() }?.let { names.putIfAbsent(it, img.ref) }
+                    img.ref
+                }
             }
         }
+        imageNamesByPlace[place.id] = names
         return place.copy(images = refs) to commits
     }
 
@@ -686,6 +697,16 @@ fun planImport(
         return placeIdMap[inFile] ?: inFile
     }
 
+    // event house photo: the reference in the file belongs to the exporting device and is never used as-is; it is
+    // matched by file name to one of the images of the place the event points to after import, or dropped
+    fun remapPhoto(placeId: String?, photo: String): String {
+        if (photo.isBlank() || placeId == null) return ""
+        val name = File(photo).name
+        if (name.isBlank()) return ""
+        imageNamesByPlace[placeId]?.get(name)?.let { return it }
+        return finalPlaces.firstOrNull { it.id == placeId }?.images?.firstOrNull { File(it).name == name } ?: ""
+    }
+
     var eventsAdded = 0
     var eventsSkipped = 0
     var relinked = 0
@@ -693,7 +714,7 @@ fun planImport(
         val remapped = fileEvents.map { e ->
             val target = remapPlace(e.placeId)
             if (target != e.placeId) relinked++
-            e.copy(placeId = target)
+            e.copy(placeId = target, invitationPhoto = remapPhoto(target, e.invitationPhoto))
         }
         when (mode) {
             ImportMode.REPLACE_ALL -> {
