@@ -99,11 +99,15 @@ class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        sharedTextState.value = extractSharedText(intent)
+        // LIFE-01: a share is handled once; after recreation (rotation, process restore) the same intent is not replayed.
+        if (savedInstanceState == null) {
+            sharedTextState.value = extractSharedText(intent)
+        }
 
         setContent {
             ShareAddApp(
                 initialSharedText = sharedTextState.value,
+                onSharedTextConsumed = { sharedTextState.value = "" },
                 openBiometric = { onSuccess ->
                     openBiometric(onSuccess)
                 }
@@ -165,6 +169,7 @@ class MainActivity : FragmentActivity() {
 @Composable
 fun ShareAddApp(
     initialSharedText: String,
+    onSharedTextConsumed: () -> Unit,
     openBiometric: (() -> Unit) -> Unit
 ) {
     val context = LocalContext.current
@@ -215,27 +220,28 @@ fun ShareAddApp(
                         openBiometric { unlocked = true }
                     }
                 )
+            } else if (showLockOverlay) {
+                // SEC-01: while the app is locked the main screen is not composed at all, so nothing behind the
+                // lock can be reached. "Back" is offered only when no PIN exists yet (create-PIN flow).
+                LockScreen(
+                    arabic = arabic,
+                    allowCancel = !hasPin(context),
+                    onCancel = { if (!hasPin(context)) showLockOverlay = false },
+                    onUnlock = { showLockOverlay = false },
+                    onBiometric = {
+                        openBiometric { showLockOverlay = false }
+                    }
+                )
             } else {
                 ShareAddScreen(
                     initialSharedText = initialSharedText,
+                    onSharedTextConsumed = onSharedTextConsumed,
                     darkMode = darkMode,
                     arabic = arabic,
                     onToggleDark = { darkMode = !darkMode },
                     onToggleArabic = { arabic = !arabic },
                     onLock = { showLockOverlay = true }
                 )
-
-                if (showLockOverlay) {
-                    LockScreen(
-                        arabic = arabic,
-                        allowCancel = true,
-                        onCancel = { showLockOverlay = false },
-                        onUnlock = { showLockOverlay = false },
-                        onBiometric = {
-                            openBiometric { showLockOverlay = false }
-                        }
-                    )
-                }
             }
         }
     }
@@ -405,6 +411,7 @@ fun LockScreen(
 @Composable
 fun ShareAddScreen(
     initialSharedText: String,
+    onSharedTextConsumed: () -> Unit,
     darkMode: Boolean,
     arabic: Boolean,
     onToggleDark: () -> Unit,
@@ -415,8 +422,25 @@ fun ShareAddScreen(
     val scope = rememberCoroutineScope()
     val drawerState = rememberDrawerState(DrawerValue.Closed)
 
-    var places by remember { mutableStateOf(loadPlaces(context)) }
-    var categories by remember { mutableStateOf(loadCategories(context)) }
+    // DATA-01: when stored data cannot be read, nothing is written back over it (saving is suspended).
+    val placesLoad = remember { loadPlacesChecked(context) }
+    val categoriesLoad = remember { loadCategoriesChecked(context) }
+    val storageWritable = placesLoad.ok && categoriesLoad.ok
+    var showStorageWarning by remember { mutableStateOf(!storageWritable) }
+
+    var places by remember { mutableStateOf(placesLoad.value) }
+    var categories by remember { mutableStateOf(categoriesLoad.value) }
+
+    val storageWarningText = if (arabic)
+        "تعذر قراءة بيانات ShareAdd المحفوظة. لم يتم تغيير البيانات الأصلية، وحُفظت نسخة استرداد داخل التطبيق. تم إيقاف الحفظ والتعديل مؤقتًا لحماية بياناتك."
+    else
+        "ShareAdd could not read its saved data. The original data was not changed, and a recovery copy was kept inside the app. Saving and editing are paused to protect your data."
+
+    fun storageBlocked(): Boolean {
+        if (storageWritable) return false
+        showStorageWarning = true
+        return true
+    }
 
     var placeName by remember { mutableStateOf("") }
     var title by remember { mutableStateOf("") }
@@ -438,10 +462,20 @@ fun ShareAddScreen(
     }
 
     LaunchedEffect(Unit) {
+        if (!storageWritable) return@LaunchedEffect
         val migration = migratePlacesImagesToPrivateStorage(context, places)
         if (migration.changed) {
             places = migration.places
             savePlaces(context, migration.places)
+        }
+        // DATA-06: a partial migration is reported as partial, never as full success
+        if (migration.failedCount > 0) {
+            message = if (arabic) {
+                "تعذر تأمين ${migration.failedCount} صورة داخل ShareAdd؛ بقيت مراجعها كما هي"
+            } else {
+                "${migration.failedCount} image(s) could not be secured inside ShareAdd; their references were kept"
+            }
+        } else if (migration.changed) {
             message = if (arabic) {
                 "تم تأمين صور الأماكن داخل ShareAdd"
             } else {
@@ -476,6 +510,8 @@ fun ShareAddScreen(
 
     LaunchedEffect(initialSharedText) {
         if (initialSharedText.isNotBlank()) {
+            onSharedTextConsumed()
+            if (storageBlocked()) return@LaunchedEffect
             val extractedUrl = extractUrl(initialSharedText)
 
             editingIndex = null
@@ -495,11 +531,11 @@ fun ShareAddScreen(
     }
 
     LaunchedEffect(places) {
-        savePlaces(context, places)
+        if (storageWritable) savePlaces(context, places)
     }
 
     LaunchedEffect(categories) {
-        saveCategories(context, categories)
+        if (storageWritable) saveCategories(context, categories)
         if (categories.none { it.ar == category.ar && it.en == category.en } && categories.isNotEmpty()) {
             category = categories.first()
         }
@@ -610,13 +646,26 @@ fun ShareAddScreen(
         }
     )
 
+    if (showStorageWarning) {
+        AlertDialog(
+            onDismissRequest = { showStorageWarning = false },
+            title = { Text(if (arabic) "حماية البيانات" else "Data Protection") },
+            text = { Text(storageWarningText) },
+            confirmButton = {
+                Button(onClick = { showStorageWarning = false }) {
+                    Text(if (arabic) "حسنًا" else "OK")
+                }
+            }
+        )
+    }
+
     if (detailsPlace != null) {
         PlaceDetailsDialog(
             place = detailsPlace!!,
             arabic = arabic,
             onClose = { detailsPlace = null },
             onOpenMap = {
-                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(detailsPlace!!.url)))
+                openMapLink(context, detailsPlace!!.url, arabic)
             },
             onShare = {
                 shareOptionsPlace = detailsPlace
@@ -626,6 +675,7 @@ fun ShareAddScreen(
                 Toast.makeText(context, if (arabic) "تم نسخ الرابط" else "Link Copied", Toast.LENGTH_SHORT).show()
             },
             onEdit = {
+                if (storageBlocked()) return@PlaceDetailsDialog
                 val place = detailsPlace!!
                 val realIndex = places.indexOf(place)
                 if (realIndex >= 0) {
@@ -1040,8 +1090,13 @@ fun ShareAddScreen(
                 editingIndex = null
             },
             onSave = {
-                if (placeName.isNotBlank() && title.isNotBlank() && url.isNotBlank()) {
-                    val fixedUrl = if (url.startsWith("http")) url else "https://$url"
+                val checkedUrl = normalizeMapUrl(url)
+                if (placeName.isNotBlank() && title.isNotBlank() && url.isNotBlank() && checkedUrl == null) {
+                    // MAP-01: the dialog stays open with the entered data; the message is shown above the dialog
+                    message = if (arabic) "رابط الخريطة غير صالح" else "The map link is not valid"
+                    Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+                } else if (placeName.isNotBlank() && title.isNotBlank() && checkedUrl != null) {
+                    val fixedUrl = checkedUrl
                     val now = System.currentTimeMillis()
 
                     val newPlace = Place(
@@ -1101,6 +1156,7 @@ fun ShareAddScreen(
     }
 
     fun openAddDialog() {
+        if (storageBlocked()) return
         editingIndex = null
         placeName = ""
         title = ""
@@ -1135,7 +1191,7 @@ fun ShareAddScreen(
                         scope.launch { drawerState.close() }
                     },
                     onCategories = {
-                        showCategoryManager = true
+                        if (!storageBlocked()) showCategoryManager = true
                         scope.launch { drawerState.close() }
                     },
                     onAbout = {
@@ -1143,11 +1199,11 @@ fun ShareAddScreen(
                         scope.launch { drawerState.close() }
                     },
                     onExport = {
-                        exportLauncher.launch("shareadd-backup-${System.currentTimeMillis()}.json")
+                        if (!storageBlocked()) exportLauncher.launch("shareadd-backup-${System.currentTimeMillis()}.json")
                         scope.launch { drawerState.close() }
                     },
                     onImport = {
-                        showImportNotice = true
+                        if (!storageBlocked()) showImportNotice = true
                         scope.launch { drawerState.close() }
                     },
                     onLock = {
@@ -1182,6 +1238,11 @@ fun ShareAddScreen(
                     Spacer(Modifier.height(10.dp))
 
                     HeroHeaderCard(arabic = arabic, totalPlaces = places.size)
+
+                    if (!storageWritable) {
+                        Spacer(Modifier.height(10.dp))
+                        Text(storageWarningText, color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.SemiBold)
+                    }
 
                     if (message.isNotBlank()) {
                         Spacer(Modifier.height(10.dp))
@@ -1272,7 +1333,7 @@ fun ShareAddScreen(
                             place = place,
                             arabic = arabic,
                             onOpenExternal = {
-                                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(place.url)))
+                                openMapLink(context, place.url, arabic)
                             },
                             onShareText = {
                                 shareOptionsPlace = place
@@ -1284,6 +1345,7 @@ fun ShareAddScreen(
                                 detailsPlace = place
                             },
                             onEdit = {
+                                if (storageBlocked()) return@PlaceCard
                                 if (realIndex >= 0) {
                                     editingIndex = realIndex
                                     placeName = place.placeName
@@ -1300,6 +1362,7 @@ fun ShareAddScreen(
                                 }
                             },
                             onDelete = {
+                                if (storageBlocked()) return@PlaceCard
                                 if (realIndex >= 0) deleteIndex = realIndex
                             },
                             onCopyLink = {
@@ -3698,12 +3761,8 @@ fun saveCategories(context: Context, categories: List<Category>) {
         .apply()
 }
 
-fun loadCategories(context: Context): List<Category> {
-    val text = context.getSharedPreferences("shareadd_categories", Context.MODE_PRIVATE)
-        .getString("categories", null)
-
-    if (text.isNullOrBlank()) return defaultCategories()
-
+/** Parses stored categories; returns null when the stored text cannot be read completely (corrupt). */
+fun parseCategoriesStrict(text: String): List<Category>? {
     return try {
         val array = JSONArray(text)
         val result = mutableListOf<Category>()
@@ -3727,8 +3786,23 @@ fun loadCategories(context: Context): List<Category> {
 
         if (result.isEmpty()) defaultCategories() else result
     } catch (_: Exception) {
-        defaultCategories()
+        null
     }
+}
+
+/** DATA-01: a read failure is reported as not-ok; the stored text is left untouched and a private recovery copy is kept. */
+fun loadCategoriesChecked(context: Context): StoreLoadResult<List<Category>> {
+    val text = try {
+        context.getSharedPreferences("shareadd_categories", Context.MODE_PRIVATE).getString("categories", null)
+    } catch (_: Exception) {
+        return StoreLoadResult(defaultCategories(), ok = false)
+    }
+
+    if (text.isNullOrBlank()) return StoreLoadResult(defaultCategories(), ok = true)
+
+    val parsed = parseCategoriesStrict(text)
+        ?: return StoreLoadResult(defaultCategories(), ok = false, recoveryFile = saveRecoveryCopy(context, "categories", text))
+    return StoreLoadResult(parsed, ok = true)
 }
 
 fun savePlaces(context: Context, places: List<Place>) {
@@ -3738,11 +3812,19 @@ fun savePlaces(context: Context, places: List<Place>) {
         .apply()
 }
 
-fun loadPlaces(context: Context): List<Place> {
-    val text = context.getSharedPreferences("shareadd_data", Context.MODE_PRIVATE)
-        .getString("places", "[]") ?: "[]"
+/** DATA-01: distinguishes "no data / valid empty list" from "stored data could not be read". */
+fun loadPlacesChecked(context: Context): StoreLoadResult<List<Place>> {
+    val text = try {
+        context.getSharedPreferences("shareadd_data", Context.MODE_PRIVATE).getString("places", null)
+    } catch (_: Exception) {
+        return StoreLoadResult(emptyList(), ok = false)
+    }
 
-    return jsonToPlaces(text)
+    if (text.isNullOrBlank()) return StoreLoadResult(emptyList(), ok = true)
+
+    val parsed = parsePlacesStrict(text)
+        ?: return StoreLoadResult(emptyList(), ok = false, recoveryFile = saveRecoveryCopy(context, "places", text))
+    return StoreLoadResult(parsed, ok = true)
 }
 
 fun placesToJson(places: List<Place>): String {
@@ -3773,7 +3855,8 @@ fun placesToJson(places: List<Place>): String {
     return array.toString()
 }
 
-fun jsonToPlaces(text: String): List<Place> {
+/** Parses the stored places; returns null if any record cannot be read (no partial list is ever returned). */
+fun parsePlacesStrict(text: String): List<Place>? {
     val result = mutableListOf<Place>()
 
     try {
@@ -3819,6 +3902,7 @@ fun jsonToPlaces(text: String): List<Place> {
             )
         }
     } catch (_: Exception) {
+        return null
     }
 
     return result
@@ -3965,10 +4049,11 @@ fun jsonToPlacesWithImages(context: Context, text: String): List<Place> {
                         if (savedImage != null) {
                             images.add(savedImage)
                         }
-                    } else if (oldUri.isNotBlank()) {
+                    } else if (oldUri.isNotBlank() && isTrustedImageRef(context, oldUri)) {
+                        // SEC-02: a reference from the file is kept only if it is a private-store path or a content:// URI
                         images.add(oldUri)
                     }
-                } else {
+                } else if (isTrustedImageRef(context, item.toString())) {
                     images.add(item.toString())
                 }
             }
@@ -4041,45 +4126,23 @@ fun copyImageToPrivateStorage(context: Context, uri: Uri): String? {
 
 data class ImageMigrationResult(
     val places: List<Place>,
-    val changed: Boolean
+    val changed: Boolean,
+    val failedCount: Int = 0
 )
 
 fun isShareAddPrivateImage(context: Context, imageRef: String): Boolean {
     return try {
         val file = File(imageRef)
-        file.isAbsolute && file.exists() && file.canonicalPath.startsWith(getShareAddImagesDir(context).canonicalPath)
+        file.isAbsolute && isTrustedImageRef(context, imageRef) && file.exists()
     } catch (_: Exception) {
         false
     }
 }
 
-fun copyFileImageToPrivateStorage(context: Context, sourceFile: File): String? {
-    return try {
-        if (!sourceFile.exists()) return null
-
-        val extension = sourceFile.extension.ifBlank { "jpg" }.lowercase()
-        val safeExtension = when (extension) {
-            "png", "webp", "jpg", "jpeg" -> extension
-            else -> "jpg"
-        }
-
-        val imageFile = File(
-            getShareAddImagesDir(context),
-            "shareadd_migrated_${System.currentTimeMillis()}_${UUID.randomUUID()}.$safeExtension"
-        )
-
-        sourceFile.inputStream().use { input ->
-            imageFile.outputStream().use { output ->
-                input.copyTo(output)
-            }
-        }
-
-        imageFile.absolutePath
-    } catch (_: Exception) {
-        null
-    }
-}
-
+/**
+ * Returns the private-store reference for an image, or null when it could not be copied.
+ * SEC-02: absolute paths outside the private store are never copied (they are not trusted image references).
+ */
 fun migrateImageRefToPrivateStorage(context: Context, imageRef: String): String? {
     if (imageRef.isBlank()) return null
 
@@ -4090,31 +4153,34 @@ fun migrateImageRefToPrivateStorage(context: Context, imageRef: String): String?
     return try {
         val file = File(imageRef)
         if (file.isAbsolute) {
-            copyFileImageToPrivateStorage(context, file)
-        } else {
+            null
+        } else if (isTrustedImageRef(context, imageRef)) {
             copyImageToPrivateStorage(context, Uri.parse(imageRef))
+        } else {
+            null
         }
     } catch (_: Exception) {
         null
     }
 }
 
+/** DATA-06: a reference that cannot be copied is kept as it was (never dropped), and counted as not migrated. */
 fun migratePlacesImagesToPrivateStorage(context: Context, places: List<Place>): ImageMigrationResult {
     var changed = false
+    var failed = 0
 
     val migratedPlaces = places.map { place ->
-        val migratedImages = place.images.mapNotNull { imageRef ->
+        val migratedImages = place.images.map { imageRef ->
+            if (isShareAddPrivateImage(context, imageRef)) return@map imageRef
+
             val migrated = migrateImageRefToPrivateStorage(context, imageRef)
-
-            if (migrated != imageRef) {
-                changed = true
+            if (migrated == null) {
+                failed++
+                imageRef
+            } else {
+                if (migrated != imageRef) changed = true
+                migrated
             }
-
-            migrated
-        }
-
-        if (migratedImages.size != place.images.size) {
-            changed = true
         }
 
         if (migratedImages != place.images) {
@@ -4124,40 +4190,60 @@ fun migratePlacesImagesToPrivateStorage(context: Context, places: List<Place>): 
         }
     }
 
-    return ImageMigrationResult(migratedPlaces, changed)
+    return ImageMigrationResult(migratedPlaces, changed, failed)
 }
 
+/**
+ * Restores one backed-up image into the private store. The bytes must decode as a PNG/JPEG/WebP image;
+ * anything else is rejected and the temporary file this call created is removed.
+ */
 fun saveBase64ImageToPrivateStorage(context: Context, base64: String): String? {
+    var temp: File? = null
     return try {
         val bytes = Base64.decode(base64, Base64.DEFAULT)
-        val imageFile = File(
-            getShareAddImagesDir(context),
-            "shareadd_restore_${System.currentTimeMillis()}_${UUID.randomUUID()}.jpg"
-        )
+        val extension = detectImageExtension(bytes.copyOfRange(0, minOf(bytes.size, 16))) ?: return null
+        val name = "shareadd_restore_${System.currentTimeMillis()}_${UUID.randomUUID()}"
+        temp = File(getShareAddImagesDir(context), "$name.part")
+        temp.outputStream().use { it.write(bytes) }
 
-        imageFile.outputStream().use {
-            it.write(bytes)
+        if (!isDecodableImage(temp)) {
+            temp.delete()
+            return null
         }
 
+        val imageFile = File(getShareAddImagesDir(context), "$name.$extension")
+        if (!temp.renameTo(imageFile)) {
+            temp.delete()
+            return null
+        }
         imageFile.absolutePath
     } catch (_: Exception) {
+        temp?.delete()
         null
     }
 }
 
+/** SEC-02: opens only trusted image references (private store files, or content:// URIs). */
 fun openShareAddImageInputStream(context: Context, imageRef: String) = try {
-    val file = File(imageRef)
-    if (file.isAbsolute) {
-        if (file.exists()) file.inputStream() else null
+    if (!isTrustedImageRef(context, imageRef)) {
+        null
     } else {
-        context.contentResolver.openInputStream(Uri.parse(imageRef))
+        val file = File(imageRef)
+        if (file.isAbsolute) {
+            if (file.exists()) file.inputStream() else null
+        } else {
+            context.contentResolver.openInputStream(Uri.parse(imageRef))
+        }
     }
 } catch (_: Exception) {
     null
 }
 
+/** SEC-02: only trusted image references can be turned into share URIs. */
 fun shareAddImageUri(context: Context, imageRef: String): Uri? {
     return try {
+        if (!isTrustedImageRef(context, imageRef)) return null
+
         val file = File(imageRef)
         if (file.isAbsolute) {
             if (!file.exists()) return null
@@ -4168,7 +4254,10 @@ fun shareAddImageUri(context: Context, imageRef: String): Uri? {
                 file
             )
         } else {
-            Uri.parse(imageRef)
+            // a legacy content:// reference is shared only if it can actually be read
+            val uri = Uri.parse(imageRef)
+            val readable = context.contentResolver.openInputStream(uri)?.use { true } ?: false
+            if (readable) uri else null
         }
     } catch (_: Exception) {
         null
