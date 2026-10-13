@@ -56,6 +56,9 @@ dependencies {
     implementation("androidx.biometric:biometric:1.1.0")
     implementation("androidx.fragment:fragment-ktx:1.8.5")
 
+    // offline QR code generation (Apache-2.0, pinned version, no runtime dependencies)
+    implementation(libs.zxing.core)
+
     testImplementation(libs.junit)
 
     androidTestImplementation(libs.androidx.junit)
