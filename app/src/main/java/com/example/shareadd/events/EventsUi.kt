@@ -447,6 +447,22 @@ fun EventEditorDialog(
                         }
                     }
 
+                    // which optional details the invitation shows (the weekday always comes with the title when a date is set)
+                    Spacer(Modifier.height(6.dp))
+                    CheckRow(
+                        checked = draft.showDate,
+                        label = if (arabic) "إظهار التاريخ في الدعوة" else "Show the date in the invitation"
+                    ) { draft = draft.copy(showDate = it) }
+                    CheckRow(
+                        checked = draft.showPlaceName,
+                        label = if (arabic) "إظهار اسم المكان في الدعوة" else "Show the place name in the invitation"
+                    ) { draft = draft.copy(showPlaceName = it) }
+                    Text(
+                        if (arabic) "اسم اليوم يظهر بجانب العنوان عند اختيار تاريخ." else "The weekday is shown next to the title when a date is set.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+                    )
+
                     if (draft.type == EventTypes.PRAYER) {
                         Spacer(Modifier.height(8.dp))
                         OutlinedTextField(

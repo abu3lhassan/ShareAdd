@@ -1896,6 +1896,8 @@ fun ShareAddScreen(
                                     type = EventTypes.GENERAL,
                                     templateId = defaultTemplateFor(EventTypes.GENERAL),
                                     language = if (arabic) "ar" else "en",
+                                    // new events: weekday only; the date line is opt-in
+                                    showDate = false,
                                     createdAt = 0L,
                                     updatedAt = now
                                 )
