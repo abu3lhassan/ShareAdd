@@ -42,7 +42,8 @@ class InvitationAndQrTest {
     fun optionalLinesAreRemovedCleanly() {
         val r = renderEvent(event(), prayerBody("ar"))
         assertTrue(r.text.contains("صلاة العشائين جماعة"))
-        assertTrue(r.text.contains("الثلاثاء 20 أكتوبر 2026"))
+        assertTrue("weekday next to the title", r.text.startsWith("🕌 صلاة العشائين جماعة — الثلاثاء"))
+        assertTrue(r.text.contains("📅 التاريخ: 20 أكتوبر 2026"))
         assertTrue(r.text.contains("6:30 م"))
         assertTrue(r.text.contains("https://maps.app.goo.gl/AbC123"))
         assertFalse("empty host line removed", r.text.contains("المستضيف"))
@@ -61,14 +62,15 @@ class InvitationAndQrTest {
         assertTrue(r.text.contains("🚪 فتح الباب: 6:00 م"))
         assertTrue(r.text.contains("⏰ وقت الصلاة: 6:30 م"))
         assertTrue(r.text.contains("يؤم المصلين: إمام الحي"))
-        assertTrue(r.text.contains("ℹ️ يرجى الحضور مبكرًا"))
+        assertTrue(r.text.contains("ℹ️ تنويه: يرجى الحضور مبكرًا"))
     }
 
     @Test
     fun englishTemplateAndFormatting() {
         val r = renderEvent(event(language = "en", host = "Abu Mohammed"), prayerBody("en"))
         assertTrue(r.text.startsWith("🕌 Maghrib & Isha congregational prayer"))
-        assertTrue(r.text.contains("📅 Date: Tuesday, October 20, 2026"))
+        assertTrue(r.text.startsWith("🕌 Maghrib & Isha congregational prayer — Tuesday"))
+        assertTrue(r.text.contains("📅 Date: October 20, 2026"))
         assertTrue(r.text.contains("⏰ Prayer time: 6:30 PM"))
         assertTrue(r.text.contains("👤 Host: Abu Mohammed"))
         // names and addresses are not translated
