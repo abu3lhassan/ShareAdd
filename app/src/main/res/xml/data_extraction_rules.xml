@@ -1,19 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?><!--
-   Sample data extraction rules file; uncomment and customize as necessary.
-   See https://developer.android.com/about/versions/12/backup-restore#xml-changes
-   for details.
+   Android 12+ backup / transfer rules.
+   SEC-03: the PIN hash is excluded from both cloud backup and device-to-device transfer;
+   temporary import files are excluded too. Other app data keeps the existing behaviour.
 -->
 <data-extraction-rules>
     <cloud-backup>
-        <!-- TODO: Use <include> and <exclude> to control what is backed up.
-        <include .../>
-        <exclude .../>
-        -->
+        <exclude domain="sharedpref" path="shareadd_security.xml" />
+        <exclude domain="file" path="shareadd_import_staging/" />
+        <exclude domain="file" path="shareadd_import_journal.json" />
+        <exclude domain="file" path="shareadd_import_journal.json.tmp" />
     </cloud-backup>
-    <!--
     <device-transfer>
-        <include .../>
-        <exclude .../>
+        <exclude domain="sharedpref" path="shareadd_security.xml" />
+        <exclude domain="file" path="shareadd_import_staging/" />
+        <exclude domain="file" path="shareadd_import_journal.json" />
+        <exclude domain="file" path="shareadd_import_journal.json.tmp" />
     </device-transfer>
-    -->
 </data-extraction-rules>

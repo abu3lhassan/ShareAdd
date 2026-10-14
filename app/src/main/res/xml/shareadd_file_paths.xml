@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
     <files-path name="shareadd_images" path="shareadd_images/" />
+    <!-- temporary QR images only (cache/shareadd_qr); no other cache content is shared -->
+    <cache-path name="shareadd_qr" path="shareadd_qr/" />
 </paths>
