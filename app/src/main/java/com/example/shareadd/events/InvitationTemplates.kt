@@ -6,8 +6,14 @@ import java.util.TimeZone
 
 /** Variables a template may use. {prayer} and {imam} are additional variables for the prayer template. */
 val TEMPLATE_VARIABLES = listOf(
-    "title", "host", "date", "time", "opening_time", "place_name", "address", "map_link", "description", "notes", "prayer", "imam"
+    "title", "host", "date", "time", "opening_time", "place_name", "address", "map_link", "description", "notes", "prayer", "imam", "day"
 )
+
+/**
+ * Variables that are an optional part of a line ("🕌 {title} — {day}"): when empty, only the variable and the
+ * separator right before it are left out, the rest of the line stays. A line made only of such empty variables is removed.
+ */
+private val INLINE_OPTIONAL_VARIABLES = setOf("day")
 
 private val VARIABLE = Regex("""\{([A-Za-z_]+)\}""")
 
@@ -25,7 +31,8 @@ fun unknownTemplateVariables(body: String): List<String> = templateVariables(bod
 /**
  * Fills a template:
  *  - every known variable is replaced by its value;
- *  - a line that contains a variable without a value is removed (optional lines disappear cleanly);
+ *  - a line that contains a variable without a value is removed (optional lines disappear cleanly), except
+ *    inline-optional variables such as {day}: only they (and the separator before them) are left out;
  *  - unknown variables are removed from the text and reported, so "{x}" or "null" never reaches the invitation;
  *  - blank lines produced by removals are collapsed.
  */
@@ -33,10 +40,16 @@ fun renderInvitation(body: String, values: Map<String, String>): RenderResult {
     val unknown = unknownTemplateVariables(body)
     val lines = body.replace("\r\n", "\n").split("\n")
     val out = mutableListOf<String>()
-    for (line in lines) {
-        val vars = VARIABLE.findAll(line).map { it.groupValues[1] }.toList()
+    for (original in lines) {
+        val vars = VARIABLE.findAll(original).map { it.groupValues[1] }.toList()
         val known = vars.filter { it in TEMPLATE_VARIABLES }
-        if (known.any { values[it].isNullOrBlank() }) continue
+        if (known.any { it !in INLINE_OPTIONAL_VARIABLES && values[it].isNullOrBlank() }) continue
+        var line = original
+        val emptyInline = known.filter { it in INLINE_OPTIONAL_VARIABLES && values[it].isNullOrBlank() }.distinct()
+        if (emptyInline.isNotEmpty()) {
+            if (known.all { it in emptyInline }) continue
+            emptyInline.forEach { name -> line = line.replace(Regex("""\s*[—–\-:,،]?\s*\{""" + name + """\}"""), "") }
+        }
         val filled = VARIABLE.replace(line) { m ->
             val name = m.groupValues[1]
             if (name in TEMPLATE_VARIABLES) values[name]?.trim().orEmpty() else ""
@@ -63,59 +76,63 @@ val BUILT_IN_TEMPLATES = listOf(
     BuiltInTemplate(
         BUILTIN_PRAYER, EventTypes.PRAYER, "صلاة جماعة", "Congregational prayer",
         bodyAr = """
-🕌 {title}
+🕌 {title} — {day}
 {imam}
 👤 المستضيف: {host}
 📅 التاريخ: {date}
 🚪 فتح الباب: {opening_time}
 ⏰ وقت الصلاة: {time}
 🏠 المكان: {place_name}
-📍 العنوان: {address}
+📍 العنوان المختصر: {address}
+🗺️ للوصول إلى الموقع: {map_link}
+
 📝 {description}
-ℹ️ {notes}
-🗺 {map_link}
+ℹ️ تنويه: {notes}
 """.trim(),
         bodyEn = """
-🕌 {title}
+🕌 {title} — {day}
 {imam}
 👤 Host: {host}
 📅 Date: {date}
 🚪 Doors open: {opening_time}
 ⏰ Prayer time: {time}
 🏠 Place: {place_name}
-📍 Address: {address}
+📍 Short address: {address}
+🗺️ Directions: {map_link}
+
 📝 {description}
-ℹ️ {notes}
-🗺 {map_link}
+ℹ️ Note: {notes}
 """.trim()
     ),
     BuiltInTemplate(
         BUILTIN_FAMILY, EventTypes.FAMILY, "مناسبة عائلية", "Family occasion",
         bodyAr = """
-💐 {title}
+💐 {title} — {day}
 👤 الداعي: {host}
 📅 التاريخ: {date}
 ⏰ الوقت: {time}
 🚪 فتح الباب: {opening_time}
 🏠 المكان: {place_name}
-📍 العنوان: {address}
+📍 العنوان المختصر: {address}
+🗺️ للوصول إلى الموقع: {map_link}
+
 📝 {description}
-ℹ️ {notes}
-🗺 {map_link}
+ℹ️ تنويه: {notes}
 
 حضوركم يسعدنا
 """.trim(),
         bodyEn = """
-💐 {title}
+💐 {title} — {day}
 👤 Hosted by: {host}
 📅 Date: {date}
 ⏰ Time: {time}
 🚪 Doors open: {opening_time}
 🏠 Place: {place_name}
-📍 Address: {address}
+📍 Short address: {address}
+🗺️ Directions: {map_link}
+
 📝 {description}
-ℹ️ {notes}
-🗺 {map_link}
+ℹ️ Note: {notes}
 
 We look forward to seeing you
 """.trim()
@@ -123,53 +140,57 @@ We look forward to seeing you
     BuiltInTemplate(
         BUILTIN_SOCIAL, EventTypes.SOCIAL, "دعوة اجتماعية / اجتماع", "Social invitation / meeting",
         bodyAr = """
-📣 {title}
+📣 {title} — {day}
 👤 المضيف: {host}
 📅 التاريخ: {date}
 ⏰ الوقت: {time}
 🚪 فتح الباب: {opening_time}
 🏠 المكان: {place_name}
-📍 العنوان: {address}
+📍 العنوان المختصر: {address}
+🗺️ للوصول إلى الموقع: {map_link}
+
 📝 {description}
-ℹ️ {notes}
-🗺 {map_link}
+ℹ️ تنويه: {notes}
 """.trim(),
         bodyEn = """
-📣 {title}
+📣 {title} — {day}
 👤 Host: {host}
 📅 Date: {date}
 ⏰ Time: {time}
 🚪 Doors open: {opening_time}
 🏠 Place: {place_name}
-📍 Address: {address}
+📍 Short address: {address}
+🗺️ Directions: {map_link}
+
 📝 {description}
-ℹ️ {notes}
-🗺 {map_link}
+ℹ️ Note: {notes}
 """.trim()
     ),
     BuiltInTemplate(
         BUILTIN_GENERAL, EventTypes.GENERAL, "قالب عام", "General",
         bodyAr = """
-{title}
+{title} — {day}
 {host}
 {date}
 {time}
 {place_name}
 {address}
+للوصول إلى الموقع: {map_link}
+
 {description}
-{notes}
-{map_link}
+تنويه: {notes}
 """.trim(),
         bodyEn = """
-{title}
+{title} — {day}
 {host}
 {date}
 {time}
 {place_name}
 {address}
+Directions: {map_link}
+
 {description}
-{notes}
-{map_link}
+Note: {notes}
 """.trim()
     )
 )
@@ -221,6 +242,23 @@ fun formatEventDate(date: String, language: String): String {
     }
 }
 
+/** Weekday of an event date: "2026-10-14" → "الأربعاء" / "Wednesday"; invalid or empty → "". */
+fun formatEventWeekday(date: String, language: String): String = formatDatePattern(date, language, "EEEE", "EEEE")
+
+/** Date line of an invitation, without the weekday (the weekday is shown with the title): "14 أكتوبر 2026" / "October 14, 2026". */
+fun formatInvitationDate(date: String, language: String): String = formatDatePattern(date, language, "d MMMM yyyy", "MMMM d, yyyy")
+
+private fun formatDatePattern(date: String, language: String, patternAr: String, patternEn: String): String {
+    if (date.isBlank()) return ""
+    return try {
+        val parser = SimpleDateFormat("yyyy-MM-dd", Locale.ROOT).apply { isLenient = false; timeZone = TimeZone.getTimeZone("UTC") }
+        val d = parser.parse(date) ?: return ""
+        SimpleDateFormat(if (language == "en") patternEn else patternAr, localeFor(language)).apply { timeZone = TimeZone.getTimeZone("UTC") }.format(d)
+    } catch (_: Exception) {
+        ""
+    }
+}
+
 /** Short form for buttons and cards (the full weekday form is too long there): "20 أكتوبر 2026" / "Oct 20, 2026". */
 fun formatEventDateShort(date: String, language: String): String {
     if (date.isBlank()) return ""
@@ -250,10 +288,11 @@ fun formatEventTime(time: String, language: String): String {
 fun invitationValues(e: ShareEvent): Map<String, String> = mapOf(
     "title" to e.title,
     "host" to e.host,
-    "date" to formatEventDate(e.date, e.language),
+    "day" to formatEventWeekday(e.date, e.language),
+    "date" to if (e.showDate) formatInvitationDate(e.date, e.language) else "",
     "time" to formatEventTime(e.time, e.language),
     "opening_time" to formatEventTime(e.openingTime, e.language),
-    "place_name" to e.place.placeName,
+    "place_name" to if (e.showPlaceName) e.place.placeName else "",
     "address" to e.place.title,
     "map_link" to e.place.url,
     "description" to e.description,

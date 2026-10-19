@@ -65,6 +65,14 @@ data class ShareEvent(
      * place (never a copy, bitmap or base64). Empty = no preference. Checked against the trusted image store when used.
      */
     val invitationPhoto: String = "",
+    /**
+     * Show the date line in the invitation. The weekday is shown next to the title whenever a date is set.
+     * Missing in events saved before this option existed → true, so their invitations keep the date.
+     * New events start with false (weekday only).
+     */
+    val showDate: Boolean = true,
+    /** Show the place name line in the invitation (true for older events). */
+    val showPlaceName: Boolean = true,
     val createdAt: Long = 0L,
     val updatedAt: Long = 0L
 )
@@ -106,6 +114,9 @@ fun writeEvent(out: JsonOut, e: ShareEvent) {
     out.field("invitationText", e.invitationText)
     out.field("textEdited", e.textEdited)
     if (e.invitationPhoto.isNotBlank()) out.field("invitationPhoto", e.invitationPhoto)
+    // written only when off, so events that use the defaults keep exactly their previous JSON
+    if (!e.showDate) out.field("showDate", false)
+    if (!e.showPlaceName) out.field("showPlaceName", false)
     out.field("createdAt", e.createdAt)
     out.field("updatedAt", e.updatedAt)
     out.endObject()
@@ -134,6 +145,8 @@ fun readEvent(input: JsonIn): ShareEvent {
             "invitationText" -> e = e.copy(invitationText = input.nextScalarAsText())
             "textEdited" -> e = e.copy(textEdited = input.nextScalarAsText() == "true")
             "invitationPhoto" -> e = e.copy(invitationPhoto = input.nextScalarAsText())
+            "showDate" -> e = e.copy(showDate = input.nextScalarAsText() == "true")
+            "showPlaceName" -> e = e.copy(showPlaceName = input.nextScalarAsText() == "true")
             "createdAt" -> e = e.copy(createdAt = input.nextLong())
             "updatedAt" -> e = e.copy(updatedAt = input.nextLong())
             else -> input.skipValue()
