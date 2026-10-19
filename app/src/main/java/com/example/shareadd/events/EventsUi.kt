@@ -731,13 +731,15 @@ fun InvitationPreviewDialog(
     // ---- share session: values for this share only; the saved event is not changed by them
     var sessionTime by rememberSaveable(event.id) { mutableStateOf(event.time) }
     var sessionOpening by rememberSaveable(event.id) { mutableStateOf(event.openingTime) }
+    var sessionDate by rememberSaveable(event.id) { mutableStateOf(event.date) }
+    var pickShareDate by rememberSaveable(event.id) { mutableStateOf(false) }
     var updateEventTimes by rememberSaveable(event.id) { mutableStateOf(false) }
     var includePhoto by rememberSaveable(event.id) { mutableStateOf(true) }
     var includeQr by rememberSaveable(event.id) { mutableStateOf(false) }
     var pickTimeFor by rememberSaveable(event.id) { mutableStateOf<String?>(null) } // "time" or "opening"
     var showPhotoPicker by rememberSaveable(event.id) { mutableStateOf(false) }
 
-    val times = ShareTimes(sessionTime, sessionOpening)
+    val times = ShareTimes(sessionTime, sessionOpening, sessionDate)
     val timesChanged = times != savedTimes(event)
     val templateBody = templateChoices(customTemplates, event.language, arabic).firstOrNull { it.id == event.templateId }?.body
     val shareTextResult = shareInvitationText(event, times, templateBody)
@@ -764,7 +766,7 @@ fun InvitationPreviewDialog(
 
     /**
      * Saved only through a share/copy action, in one update:
-     *  - the session times, when "update the event with these times" is ticked (never otherwise);
+     *  - the session date and times, when "update the event with these values" is ticked (never otherwise);
      *  - the house photo actually shared, so the event remembers it (the place photo itself is untouched).
      */
     fun saveShareChoices(sharedPhoto: String?) {
@@ -777,7 +779,7 @@ fun InvitationPreviewDialog(
         onUpdateEvent(updated)
         if (saveTimes) {
             updateEventTimes = false
-            Toast.makeText(context, if (arabic) "تم تحديث أوقات المناسبة" else "Event times updated", Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, if (arabic) "تم تحديث تاريخ وأوقات المناسبة" else "Event date and times updated", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -816,13 +818,17 @@ fun InvitationPreviewDialog(
                     ) { Text(if (arabic) "تحديث بيانات الموقع من العنوان المحفوظ" else "Update place details from the saved place") }
                 }
 
-                // ---- times for this share
+                // ---- date and times for this share
                 Surface(
                     shape = RoundedCornerShape(18.dp),
                     color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f)
                 ) {
                     Column(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Text(if (arabic) "أوقات هذه المشاركة" else "Times for this share", fontWeight = FontWeight.SemiBold)
+                        Text(if (arabic) "تاريخ وأوقات هذه المشاركة" else "Date and times for this share", fontWeight = FontWeight.SemiBold)
+                        // the weekday shown here is derived from the chosen date; it is never chosen separately
+                        OutlinedButton(onClick = { pickShareDate = true }, modifier = Modifier.fillMaxWidth()) {
+                            Text("📅 " + formatEventDate(sessionDate, uiLang).ifBlank { if (arabic) "التاريخ: اختيار" else "Date: Choose" })
+                        }
                         OutlinedButton(onClick = { pickTimeFor = "time" }, modifier = Modifier.fillMaxWidth()) {
                             Text(
                                 (if (isPrayer) if (arabic) "⏰ وقت الصلاة: " else "⏰ Prayer time: " else if (arabic) "⏰ الوقت: " else "⏰ Time: ") +
@@ -843,29 +849,29 @@ fun InvitationPreviewDialog(
                         if (timesChanged) {
                             Text(
                                 (if (arabic) "لهذه المشاركة فقط. المحفوظ في المناسبة: " else "For this share only. Saved in the event: ") +
-                                    listOf(timeLabel(event.time), timeLabel(event.openingTime).let { if (it.isBlank()) "" else (if (arabic) "فتح الباب " else "doors ") + it })
+                                    listOf(formatEventDateShort(event.date, uiLang), timeLabel(event.time), timeLabel(event.openingTime).let { if (it.isBlank()) "" else (if (arabic) "فتح الباب " else "doors ") + it })
                                         .filter { it.isNotBlank() }.joinToString(" — ").ifBlank { "—" },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                             CheckRow(
                                 checked = updateEventTimes,
-                                label = if (arabic) "تحديث المناسبة بهذه الأوقات" else "Update the event with these times",
+                                label = if (arabic) "تحديث المناسبة بهذه القيم" else "Update the event with these values",
                                 onChange = { updateEventTimes = it }
                             )
-                            TextButton(onClick = { sessionTime = event.time; sessionOpening = event.openingTime; updateEventTimes = false }) {
-                                Text(if (arabic) "الرجوع للأوقات المحفوظة" else "Back to saved times")
+                            TextButton(onClick = { sessionTime = event.time; sessionOpening = event.openingTime; sessionDate = event.date; updateEventTimes = false }) {
+                                Text(if (arabic) "الرجوع للقيم المحفوظة" else "Back to saved values")
                             }
                         }
                         when (shareTextResult.source) {
                             ShareTextSource.TIMES_REPLACED -> Text(
-                                if (arabic) "نصك معدّل يدويًا؛ استُبدل الوقت فيه لهذه المشاركة فقط." else "Your text is hand-edited; the time in it was replaced for this share only.",
+                                if (arabic) "نصك معدّل يدويًا؛ استُبدل التاريخ/الوقت فيه لهذه المشاركة فقط." else "Your text is hand-edited; the date/time in it was replaced for this share only.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.secondary
                             )
                             ShareTextSource.TIMES_NOT_APPLIED -> Text(
-                                if (arabic) "نصك معدّل يدويًا ولا يمكن وضع الأوقات الجديدة فيه بأمان؛ سيُشارك كما هو. عدّله من «تعديل» إن لزم."
-                                else "Your text is hand-edited and the new times cannot be placed in it safely; it is shared as it is. Change it from Edit if needed.",
+                                if (arabic) "نصك معدّل يدويًا ولا يمكن وضع التاريخ/الأوقات الجديدة فيه بأمان؛ سيُشارك كما هو. عدّله من «تعديل» إن لزم."
+                                else "Your text is hand-edited and the new date/times cannot be placed in it safely; it is shared as it is. Change it from Edit if needed.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.error,
                                 fontWeight = FontWeight.SemiBold
@@ -998,6 +1004,20 @@ fun InvitationPreviewDialog(
         confirmButton = {},
         dismissButton = { TextButton(onClick = onClose) { Text(if (arabic) "إغلاق" else "Close") } }
     )
+
+    if (pickShareDate) {
+        val state = rememberDatePickerState(initialSelectedDateMillis = parseDateMillis(sessionDate) ?: System.currentTimeMillis())
+        DatePickerDialog(
+            onDismissRequest = { pickShareDate = false },
+            confirmButton = {
+                TextButton(onClick = {
+                    state.selectedDateMillis?.let { sessionDate = millisToDate(it) }
+                    pickShareDate = false
+                }) { Text(if (arabic) "تم" else "OK") }
+            },
+            dismissButton = { TextButton(onClick = { pickShareDate = false }) { Text(if (arabic) "إلغاء" else "Cancel") } }
+        ) { DatePicker(state = state) }
+    }
 
     pickTimeFor?.let { which ->
         val current = if (which == "opening") sessionOpening.ifBlank { sessionTime } else sessionTime

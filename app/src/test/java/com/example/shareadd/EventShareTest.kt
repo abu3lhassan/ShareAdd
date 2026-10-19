@@ -16,8 +16,10 @@ import com.example.shareadd.events.ShareEvent
 import com.example.shareadd.events.ShareTextSource
 import com.example.shareadd.events.ShareTimes
 import com.example.shareadd.events.applyShareTimes
+import com.example.shareadd.events.dateFor
 import com.example.shareadd.events.defaultPrayerTitle
 import com.example.shareadd.events.eventsToJson
+import com.example.shareadd.events.formatEventWeekday
 import com.example.shareadd.events.invitationPhotoChoice
 import com.example.shareadd.events.parseEventsStrict
 import com.example.shareadd.events.renderEvent
@@ -235,5 +237,130 @@ class EventShareTest {
         val kept = applyShareTimes(e, ShareTimes("18:15", ""), cleared, now = 5)
         assertEquals(custom, kept.invitationText)
         assertEquals("", kept.openingTime)
+    }
+
+    // ------------------------------------------------------------------ share-date override (2026-10-20 = Tuesday, 2026-10-25 = Sunday)
+
+    @Test
+    fun savedDateIsUsedInitially() { // D1
+        val e = prayerEvent()
+        val t = savedTimes(e)
+        assertEquals("2026-10-20", t.dateFor(e))
+        val r = shareInvitationText(e, t, prayerBody)
+        assertEquals(ShareTextSource.SAVED, r.source)
+        assertTrue(r.text.contains("الثلاثاء"))
+        assertTrue(r.text.contains("📅 التاريخ: 20 أكتوبر 2026"))
+    }
+
+    @Test
+    fun temporaryDateChangesThePreviewAndNotTheSavedEvent() { // D2, D3
+        val e = prayerEvent()
+        val before = eventsToJson(listOf(e))
+        val r = shareInvitationText(e, ShareTimes("18:15", "17:50", "2026-10-25"), prayerBody)
+        assertEquals(ShareTextSource.TEMPLATE, r.source)
+        assertTrue(r.text.contains("— الأحد"))
+        assertTrue(r.text.contains("📅 التاريخ: 25 أكتوبر 2026"))
+        assertFalse(r.text.contains("الثلاثاء"))
+        assertFalse(r.text.contains("20 أكتوبر"))
+        assertEquals("override does not change the event", before, eventsToJson(listOf(e)))
+        assertEquals("2026-10-20", e.date)
+    }
+
+    @Test
+    fun explicitUpdatePersistsTheSelectedDateOnly() { // D4
+        val e = prayerEvent()
+        val times = ShareTimes("18:15", "17:50", "2026-10-25")
+        val r = shareInvitationText(e, times, prayerBody)
+        val updated = applyShareTimes(e, times, r, now = 77)
+        assertEquals(e.copy(date = "2026-10-25", invitationText = r.text, updatedAt = 77), updated)
+    }
+
+    @Test
+    fun weekdayIsAlwaysDerivedFromTheSelectedDate() { // D5
+        assertEquals("الأحد", formatEventWeekday("2026-10-25", "ar"))
+        assertEquals("Sunday", formatEventWeekday("2026-10-25", "en"))
+        assertEquals("الثلاثاء", formatEventWeekday("2026-10-20", "ar"))
+        // English template: weekday next to the title follows the date
+        val enBody = BUILT_IN_TEMPLATES.first { it.id == BUILTIN_PRAYER }.bodyEn
+        val en = prayerEvent().copy(language = "en").let { it.copy(invitationText = renderEvent(it, enBody).text) }
+        val r = shareInvitationText(en, ShareTimes("18:15", "17:50", "2026-10-25"), enBody).text
+        assertTrue(r.contains("— Sunday"))
+        assertTrue(r.contains("Date: October 25, 2026"))
+        assertFalse(r.contains("Tuesday"))
+    }
+
+    @Test
+    fun dateAndTimesAreIndependent() { // D6, D7, D8
+        val e = prayerEvent()
+        val dateOnly = ShareTimes(e.time, e.openingTime, "2026-10-25")
+        val r = shareInvitationText(e, dateOnly, prayerBody)
+        assertTrue(r.text.contains("⏰ وقت الصلاة: 6:15 م"))
+        assertTrue(r.text.contains("🚪 فتح الباب: 5:50 م"))
+        val saved = applyShareTimes(e, dateOnly, r, now = 3)
+        assertEquals("18:15", saved.time)
+        assertEquals("17:50", saved.openingTime)
+
+        val timeOnly = ShareTimes("18:30", "17:50", e.date)
+        val t = shareInvitationText(e, timeOnly, prayerBody).text
+        assertTrue(t.contains("الثلاثاء"))
+        assertTrue(t.contains("20 أكتوبر 2026"))
+        assertEquals("2026-10-20", applyShareTimes(e, timeOnly, shareInvitationText(e, timeOnly, prayerBody), 3).date)
+
+        // all three together, and a cleared doors-open time with a new date
+        val all = shareInvitationText(e, ShareTimes("19:00", "18:30", "2026-10-25"), prayerBody).text
+        assertTrue(all.contains("الأحد") && all.contains("7:00 م") && all.contains("6:30 م"))
+        val cleared = shareInvitationText(e, ShareTimes("18:15", "", "2026-10-25"), prayerBody).text
+        assertFalse(cleared.contains("فتح الباب"))
+        assertTrue(cleared.contains("25 أكتوبر 2026"))
+    }
+
+    @Test
+    fun templateTextUsesSelectedDateEvenWhenTheDateLineIsHidden() { // D9
+        val e = prayerEvent().copy(showDate = false).let { it.copy(invitationText = renderEvent(it, prayerBody).text) }
+        val r = shareInvitationText(e, ShareTimes("18:15", "17:50", "2026-10-25"), prayerBody)
+        assertEquals(ShareTextSource.TEMPLATE, r.source)
+        assertTrue(r.text.contains("— الأحد"))
+        assertFalse(r.text.contains("التاريخ"))
+    }
+
+    @Test
+    fun handEditedTextDateIsReplacedOnlyWhenUnambiguous() { // D10, D11
+        val custom = "صلاة العشاء يوم الثلاثاء 20 أكتوبر 2026\nالساعة 6:15 م"
+        val e = prayerEvent().copy(invitationText = custom, textEdited = true)
+        val r = shareInvitationText(e, ShareTimes("18:15", "17:50", "2026-10-25"), prayerBody)
+        assertEquals(ShareTextSource.TIMES_REPLACED, r.source)
+        assertEquals("صلاة العشاء يوم الأحد 25 أكتوبر 2026\nالساعة 6:15 م", r.text)
+        // weekday only (no date line) is still safe
+        val dayOnly = e.copy(invitationText = "نلقاكم الثلاثاء الساعة 6:15 م")
+        assertEquals("نلقاكم الأحد الساعة 6:15 م", shareInvitationText(dayOnly, ShareTimes("18:15", "17:50", "2026-10-25"), prayerBody).text)
+        // date + time together
+        val both = shareInvitationText(e, ShareTimes("18:40", "17:50", "2026-10-25"), prayerBody)
+        assertEquals("صلاة العشاء يوم الأحد 25 أكتوبر 2026\nالساعة 6:40 م", both.text)
+
+        // unsafe: weekday twice / no date at all → the saved text unchanged, with the warning source
+        val twice = e.copy(invitationText = "الثلاثاء ثم الثلاثاء القادم")
+        val t = shareInvitationText(twice, ShareTimes("18:15", "17:50", "2026-10-25"), prayerBody)
+        assertEquals(ShareTextSource.TIMES_NOT_APPLIED, t.source)
+        assertEquals(twice.invitationText, t.text)
+        val none = e.copy(invitationText = "تفضلوا الساعة 6:15 م")
+        assertEquals(ShareTextSource.TIMES_NOT_APPLIED, shareInvitationText(none, ShareTimes("18:15", "17:50", "2026-10-25"), prayerBody).source)
+        // explicit update with text that could not take the date: date saved, text kept
+        val kept = applyShareTimes(none, ShareTimes("18:15", "17:50", "2026-10-25"), shareInvitationText(none, ShareTimes("18:15", "17:50", "2026-10-25"), prayerBody), 9)
+        assertEquals("2026-10-25", kept.date)
+        assertEquals(none.invitationText, kept.invitationText)
+        assertEquals("stored hand-edited text unchanged", custom, e.invitationText)
+    }
+
+    @Test
+    fun previewAndSharedTextUseTheSameEffectiveDate() { // D12
+        // the dialog renders and shares the same ShareText; the same inputs must always give the same text
+        val e = prayerEvent()
+        val times = ShareTimes("18:15", "17:50", "2026-10-25")
+        val preview = shareInvitationText(e, times, prayerBody)
+        val shared = shareInvitationText(e, times, prayerBody)
+        assertEquals(preview, shared)
+        assertEquals(preview.text, applyShareTimes(e, times, preview, 1).invitationText)
+        // a null date means the saved date, never "no date"
+        assertEquals(shareInvitationText(e, ShareTimes("18:30", "17:50"), prayerBody), shareInvitationText(e, ShareTimes("18:30", "17:50", e.date), prayerBody))
     }
 }
