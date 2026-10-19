@@ -3,25 +3,34 @@ package com.example.shareadd.events
 import com.example.shareadd.Place
 
 /*
- * Share session: values used for ONE share from the invitation preview (times, house photo, QR).
+ * Share session: values used for ONE share from the invitation preview (date, times, house photo, QR).
  * Nothing here changes the saved event; only [applyShareTimes] builds an updated event, and the caller
  * uses it only when the user explicitly asked to update the event.
  */
 
-/** Event/prayer time and doors-open time for this share ("HH:mm" or empty). They are independent values. */
-data class ShareTimes(val time: String, val openingTime: String)
+/**
+ * Event/prayer time and doors-open time ("HH:mm" or empty) and date ("yyyy-MM-dd") for this share. They are independent
+ * values. [date] null = the event's saved date. The weekday is never stored: it is always derived from the date.
+ */
+data class ShareTimes(val time: String, val openingTime: String, val date: String? = null)
 
-fun savedTimes(event: ShareEvent) = ShareTimes(event.time, event.openingTime)
+fun savedTimes(event: ShareEvent) = ShareTimes(event.time, event.openingTime, event.date)
+
+/** The session values with the date resolved (null → the saved date). */
+private fun ShareTimes.resolved(event: ShareEvent) = if (date == null) copy(date = event.date) else this
+
+/** The date this share uses. */
+fun ShareTimes.dateFor(event: ShareEvent): String = date ?: event.date
 
 /** How the text shown/shared for this session was produced. */
 enum class ShareTextSource {
-    /** times equal the saved ones: the saved invitation text, unchanged */
+    /** date and times equal the saved ones: the saved invitation text, unchanged */
     SAVED,
-    /** template-managed text, rebuilt from its template with this session's times */
+    /** template-managed text, rebuilt from its template with this session's date and times */
     TEMPLATE,
-    /** hand-edited (or no longer template-generated) text: only the time strings were replaced */
+    /** hand-edited (or no longer template-generated) text: only the date/weekday and time strings were replaced */
     TIMES_REPLACED,
-    /** the new times could not be placed safely in the custom text: the saved text is used unchanged */
+    /** the new date or times could not be placed safely in the custom text: the saved text is used unchanged */
     TIMES_NOT_APPLIED
 }
 
@@ -29,17 +38,21 @@ data class ShareText(val text: String, val source: ShareTextSource)
 
 /**
  * The invitation text for this share.
- *  - Times unchanged → the saved text exactly.
+ *  - Date and times unchanged → the saved text exactly.
  *  - Text still generated from its template (not hand-edited, and equal to what the template gives for the saved
- *    values) → rebuilt from the template with the session times; an empty doors-open time drops its line.
+ *    values) → rebuilt from the template with the session date and times ({day} and {date} follow the session date);
+ *    an empty doors-open time drops its line.
  *  - Otherwise (hand-edited text) → each changed time is replaced only where the saved time appears exactly once and
- *    cannot be confused with the other time; if any change cannot be placed this way, the saved text is used unchanged.
+ *    cannot be confused with the other time; a changed date replaces the saved weekday and date line, each only where
+ *    it appears exactly once (at least one of them must be found). If any change cannot be placed this way, the saved
+ *    text is used unchanged.
  * The saved event is never modified here.
  */
 fun shareInvitationText(event: ShareEvent, times: ShareTimes, templateBody: String?): ShareText {
+    @Suppress("NAME_SHADOWING") val times = times.resolved(event)
     if (times == savedTimes(event)) return ShareText(event.invitationText, ShareTextSource.SAVED)
 
-    val session = event.copy(time = times.time, openingTime = times.openingTime)
+    val session = event.copy(time = times.time, openingTime = times.openingTime, date = times.dateFor(event))
     if (!event.textEdited && templateBody != null && renderEvent(event, templateBody).text == event.invitationText) {
         return ShareText(renderEvent(session, templateBody).text, ShareTextSource.TEMPLATE)
     }
@@ -71,20 +84,47 @@ private fun replaceTimesInText(event: ShareEvent, times: ShareTimes): String? {
     if (times.openingTime != event.openingTime) {
         if (!replaceOnce(savedOpening, formatEventTime(times.openingTime, lang), savedTime)) return null
     }
+    if (times.dateFor(event) != event.date) text = replaceDateInText(text, event.date, times.dateFor(event), lang) ?: return null
     return text
 }
 
 /**
- * The event with this session's times saved (only used when the user ticked "update the event with these times").
- * The invitation text follows the session text when it could be produced; a custom text that could not take the
- * new times is kept as it was.
+ * Replaces the saved weekday ("الأحد" / "Sunday") and date line ("25 أكتوبر 2026" / "October 25, 2026") by those of the
+ * new date. Each is replaced only if it appears exactly once as a whole word / number; null when neither is found, one
+ * appears more than once, or a date is missing.
+ */
+private fun replaceDateInText(text: String, oldDate: String, newDate: String, lang: String): String? {
+    val oldDay = formatEventWeekday(oldDate, lang)
+    val oldLine = formatInvitationDate(oldDate, lang)
+    val newDay = formatEventWeekday(newDate, lang)
+    val newLine = formatInvitationDate(newDate, lang)
+    if (oldDay.isBlank() || oldLine.isBlank() || newDay.isBlank() || newLine.isBlank()) return null
+
+    val dayPattern = Regex("(?<!\\p{L})" + Regex.escape(oldDay) + "(?!\\p{L})")
+    val linePattern = Regex("(?<![0-9])" + Regex.escape(oldLine) + "(?![0-9])")
+    val days = dayPattern.findAll(text).toList()
+    val lines = linePattern.findAll(text).toList()
+    if (days.size > 1 || lines.size > 1 || (days.isEmpty() && lines.isEmpty())) return null
+
+    // replace from the end so the earlier range stays valid
+    val edits = (days.map { it.range to newDay } + lines.map { it.range to newLine }).sortedByDescending { it.first.first }
+    if (edits.size == 2 && edits[0].first.first <= edits[1].first.last) return null // overlapping: not safe
+    var result = text
+    edits.forEach { (range, value) -> result = result.replaceRange(range, value) }
+    return result
+}
+
+/**
+ * The event with this session's date and times saved (only used when the user ticked "update the event with these
+ * values"). The invitation text follows the session text when it could be produced; a custom text that could not take
+ * the new values is kept as it was.
  */
 fun applyShareTimes(event: ShareEvent, times: ShareTimes, shareText: ShareText, now: Long): ShareEvent {
     val text = when (shareText.source) {
         ShareTextSource.TEMPLATE, ShareTextSource.TIMES_REPLACED -> shareText.text
         ShareTextSource.SAVED, ShareTextSource.TIMES_NOT_APPLIED -> event.invitationText
     }
-    return event.copy(time = times.time, openingTime = times.openingTime, invitationText = text, updatedAt = now)
+    return event.copy(time = times.time, openingTime = times.openingTime, date = times.dateFor(event), invitationText = text, updatedAt = now)
 }
 
 /** House photo options for an event: the photos that can be used, the suggested one, and a lost preference. */
