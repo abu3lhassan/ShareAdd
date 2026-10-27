@@ -4,10 +4,41 @@ import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
 
-/** Variables a template may use. {prayer} and {imam} are additional variables for the prayer template. */
+/** Variables an invitation (event) template may use. {prayer}, {imam} and {iqama_time} are meant for prayer templates. */
 val TEMPLATE_VARIABLES = listOf(
-    "title", "host", "date", "time", "opening_time", "place_name", "address", "map_link", "description", "notes", "prayer", "imam", "day"
+    "title", "host", "date", "time", "opening_time", "place_name", "address", "map_link", "description", "notes", "prayer", "imam", "day",
+    "iqama_time", "day_date"
 )
+
+/** Template type of place-sharing templates (stored in [InvitationTemplate.type] next to the event types). */
+const val PLACE_TEMPLATE_TYPE = "place"
+
+/** Variables a place-sharing template may use. The place's private notes are never one of them. */
+val PLACE_TEMPLATE_VARIABLES = listOf("place_name", "address", "description", "map_link", "category", "rating", "notes")
+
+fun variablesFor(templateType: String): List<String> = if (templateType == PLACE_TEMPLATE_TYPE) PLACE_TEMPLATE_VARIABLES else TEMPLATE_VARIABLES
+
+/** Names shown to the user for each variable (the "Insert field" menu); the {name} itself stays the stable identity. */
+fun variableLabel(name: String, arabic: Boolean): String = when (name) {
+    "title" -> if (arabic) "عنوان المناسبة" else "Event title"
+    "host" -> if (arabic) "المستضيف" else "Host"
+    "day" -> if (arabic) "اليوم" else "Weekday"
+    "date" -> if (arabic) "التاريخ" else "Date"
+    "day_date" -> if (arabic) "الموعد (اليوم أو اليوم والتاريخ)" else "Day (or day and date)"
+    "time" -> if (arabic) "وقت المناسبة / دخول وقت الصلاة" else "Event time / prayer time"
+    "iqama_time" -> if (arabic) "وقت الإقامة" else "Iqama time"
+    "opening_time" -> if (arabic) "وقت فتح الباب" else "Doors open"
+    "place_name" -> if (arabic) "اسم المكان" else "Place name"
+    "address" -> if (arabic) "العنوان المختصر" else "Short address"
+    "map_link" -> if (arabic) "رابط الموقع" else "Location link"
+    "description" -> if (arabic) "الوصف" else "Description"
+    "notes" -> if (arabic) "التنويهات" else "Notices"
+    "prayer" -> if (arabic) "الصلاة" else "Prayer"
+    "imam" -> if (arabic) "عبارة الإمامة" else "Imam line"
+    "category" -> if (arabic) "التصنيف" else "Category"
+    "rating" -> if (arabic) "التقييم" else "Rating"
+    else -> name
+}
 
 /**
  * Variables that are an optional part of a line ("🕌 {title} — {day}"): when empty, only the variable and the
@@ -26,7 +57,8 @@ data class RenderResult(
 /** Variable names used in a template, and the ones that are not supported. */
 fun templateVariables(body: String): List<String> = VARIABLE.findAll(body).map { it.groupValues[1] }.distinct().toList()
 
-fun unknownTemplateVariables(body: String): List<String> = templateVariables(body).filterNot { it in TEMPLATE_VARIABLES }
+fun unknownTemplateVariables(body: String, known: List<String> = TEMPLATE_VARIABLES): List<String> =
+    templateVariables(body).filterNot { it in known }
 
 /**
  * Fills a template:
@@ -34,28 +66,33 @@ fun unknownTemplateVariables(body: String): List<String> = templateVariables(bod
  *  - a line that contains a variable without a value is removed (optional lines disappear cleanly), except
  *    inline-optional variables such as {day}: only they (and the separator before them) are left out;
  *  - unknown variables are removed from the text and reported, so "{x}" or "null" never reaches the invitation;
+ *  - a value of several lines (notices written as a list) keeps all its lines, breaks and bullets; when the line has
+ *    text before it ("ℹ️ تنويه: {notes}"), that text stays on its own line as the heading and the list follows after a
+ *    blank line (the heading comes only from the template, nothing is added to it);
  *  - blank lines produced by removals are collapsed.
  */
-fun renderInvitation(body: String, values: Map<String, String>): RenderResult {
-    val unknown = unknownTemplateVariables(body)
+fun renderInvitation(body: String, values: Map<String, String>, knownVariables: List<String> = TEMPLATE_VARIABLES): RenderResult {
+    val known = knownVariables
+    val unknown = unknownTemplateVariables(body, known)
     val lines = body.replace("\r\n", "\n").split("\n")
     val out = mutableListOf<String>()
     for (original in lines) {
         val vars = VARIABLE.findAll(original).map { it.groupValues[1] }.toList()
-        val known = vars.filter { it in TEMPLATE_VARIABLES }
-        if (known.any { it !in INLINE_OPTIONAL_VARIABLES && values[it].isNullOrBlank() }) continue
+        val used = vars.filter { it in known }
+        if (used.any { it !in INLINE_OPTIONAL_VARIABLES && values[it].isNullOrBlank() }) continue
         var line = original
-        val emptyInline = known.filter { it in INLINE_OPTIONAL_VARIABLES && values[it].isNullOrBlank() }.distinct()
+        val emptyInline = used.filter { it in INLINE_OPTIONAL_VARIABLES && values[it].isNullOrBlank() }.distinct()
         if (emptyInline.isNotEmpty()) {
-            if (known.all { it in emptyInline }) continue
+            if (used.all { it in emptyInline }) continue
             emptyInline.forEach { name -> line = line.replace(Regex("""\s*[—–\-:,،]?\s*\{""" + name + """\}"""), "") }
         }
         val filled = VARIABLE.replace(line) { m ->
             val name = m.groupValues[1]
-            if (name in TEMPLATE_VARIABLES) values[name]?.trim().orEmpty() else ""
+            val value = if (name in known) values[name]?.replace("\r\n", "\n")?.trim().orEmpty() else ""
+            if ('\n' in value && line.substring(0, m.range.first).isNotBlank()) "\n\n" + value else value
         }
         if (vars.isNotEmpty() && filled.isBlank()) continue
-        out.add(filled.trimEnd())
+        filled.split("\n").forEach { out.add(it.trimEnd()) }
     }
     val text = out.joinToString("\n")
         .replace(Regex("""\n{3,}"""), "\n\n")
@@ -82,6 +119,7 @@ val BUILT_IN_TEMPLATES = listOf(
 📅 التاريخ: {date}
 🚪 فتح الباب: {opening_time}
 ⏰ وقت الصلاة: {time}
+🕋 وقت الإقامة: {iqama_time}
 🏠 المكان: {place_name}
 📍 العنوان المختصر: {address}
 🗺️ للوصول إلى الموقع: {map_link}
@@ -96,6 +134,7 @@ val BUILT_IN_TEMPLATES = listOf(
 📅 Date: {date}
 🚪 Doors open: {opening_time}
 ⏰ Prayer time: {time}
+🕋 Iqama: {iqama_time}
 🏠 Place: {place_name}
 📍 Short address: {address}
 🗺️ Directions: {map_link}
@@ -195,13 +234,73 @@ Note: {notes}
     )
 )
 
-/** A template the event editor can choose: a built-in one (in the event language) or a custom one. */
+// ------------------------------------------------------------------ built-in place-sharing templates
+
+const val BUILTIN_PLACE_DETAILED = "builtin-place-detailed"
+const val BUILTIN_PLACE_SHORT = "builtin-place-short"
+
+/** One optional ShareAdd signature, inside the template (the user can edit or delete it); nothing is added outside. */
+val BUILT_IN_PLACE_TEMPLATES = listOf(
+    BuiltInTemplate(
+        BUILTIN_PLACE_DETAILED, PLACE_TEMPLATE_TYPE, "مشاركة مفصلة", "Detailed share",
+        bodyAr = """
+📍 {place_name}
+🏠 العنوان المختصر: {address}
+🗂 التصنيف: {category}
+⭐ التقييم: {rating}
+📝 {description}
+🗺️ للوصول إلى الموقع: {map_link}
+
+ℹ️ تنويه: {notes}
+
+تمت المشاركة عبر ShareAdd
+""".trim(),
+        bodyEn = """
+📍 {place_name}
+🏠 Short address: {address}
+🗂 Category: {category}
+⭐ Rating: {rating}
+📝 {description}
+🗺️ Directions: {map_link}
+
+ℹ️ Note: {notes}
+
+Shared via ShareAdd
+""".trim()
+    ),
+    BuiltInTemplate(
+        BUILTIN_PLACE_SHORT, PLACE_TEMPLATE_TYPE, "مشاركة مختصرة", "Short share",
+        bodyAr = """
+📍 {place_name}
+🏠 {address}
+🗺️ {map_link}
+
+ℹ️ {notes}
+""".trim(),
+        bodyEn = """
+📍 {place_name}
+🏠 {address}
+🗺️ {map_link}
+
+ℹ️ {notes}
+""".trim()
+    )
+)
+
+/** A template that can be chosen: a built-in one (in the requested language) or a custom one. */
 data class TemplateChoice(val id: String, val name: String, val type: String, val body: String, val builtIn: Boolean)
 
+/** Invitation templates for events (place-sharing templates are never mixed in). */
 fun templateChoices(custom: List<InvitationTemplate>, language: String, arabicUi: Boolean): List<TemplateChoice> =
     BUILT_IN_TEMPLATES.map {
         TemplateChoice(it.id, if (arabicUi) it.nameAr else it.nameEn, it.type, if (language == "en") it.bodyEn else it.bodyAr, true)
-    } + custom.map { TemplateChoice(it.id, it.name, it.type, it.body, false) }
+    } + custom.filter { it.type != PLACE_TEMPLATE_TYPE }.map { TemplateChoice(it.id, it.name, it.type, it.body, false) }
+
+/** Place-sharing templates: the built-in ones in the share language, then the user's own place templates. */
+fun placeTemplateChoices(custom: List<InvitationTemplate>, language: String, arabicUi: Boolean): List<TemplateChoice> =
+    BUILT_IN_PLACE_TEMPLATES.map {
+        TemplateChoice(it.id, if (arabicUi) it.nameAr else it.nameEn, it.type, if (language == "en") it.bodyEn else it.bodyAr, true)
+    } + custom.filter { it.type == PLACE_TEMPLATE_TYPE }.map { TemplateChoice(it.id, it.name, it.type, it.body, false) }
 
 fun defaultTemplateFor(type: String): String = when (type) {
     EventTypes.PRAYER -> BUILTIN_PRAYER
@@ -211,6 +310,7 @@ fun defaultTemplateFor(type: String): String = when (type) {
 }
 
 fun eventTypeLabel(type: String, arabic: Boolean): String = when (type) {
+    PLACE_TEMPLATE_TYPE -> if (arabic) "مشاركة مكان" else "Place share"
     EventTypes.PRAYER -> if (arabic) "صلاة جماعة" else "Prayer"
     EventTypes.FAMILY -> if (arabic) "مناسبة عائلية" else "Family"
     EventTypes.SOCIAL -> if (arabic) "اجتماعية / اجتماع" else "Social / meeting"
@@ -290,7 +390,9 @@ fun invitationValues(e: ShareEvent): Map<String, String> = mapOf(
     "host" to e.host,
     "day" to formatEventWeekday(e.date, e.language),
     "date" to if (e.showDate) formatInvitationDate(e.date, e.language) else "",
+    "day_date" to if (e.showDate) formatEventDate(e.date, e.language) else formatEventWeekday(e.date, e.language),
     "time" to formatEventTime(e.time, e.language),
+    "iqama_time" to formatEventTime(e.iqamaTime, e.language),
     "opening_time" to formatEventTime(e.openingTime, e.language),
     "place_name" to if (e.showPlaceName) e.place.placeName else "",
     "address" to e.place.title,
@@ -302,3 +404,28 @@ fun invitationValues(e: ShareEvent): Map<String, String> = mapOf(
 )
 
 fun renderEvent(e: ShareEvent, templateBody: String): RenderResult = renderInvitation(templateBody, invitationValues(e))
+
+/**
+ * Values for a place-sharing template. [notes] are the notices written for this one share (never stored in the place);
+ * the place's private notes are not available here.
+ */
+fun placeShareValues(
+    placeName: String,
+    shortAddress: String,
+    description: String,
+    url: String,
+    category: String,
+    rating: Int,
+    notes: String
+): Map<String, String> = mapOf(
+    "place_name" to placeName,
+    "address" to shortAddress,
+    "description" to description,
+    "map_link" to url,
+    "category" to category,
+    "rating" to if (rating in 1..5) "$rating/5" else "",
+    "notes" to notes
+)
+
+fun renderPlaceShare(templateBody: String, values: Map<String, String>): RenderResult =
+    renderInvitation(templateBody, values, PLACE_TEMPLATE_VARIABLES)
