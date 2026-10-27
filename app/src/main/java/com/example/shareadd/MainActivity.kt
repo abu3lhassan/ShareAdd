@@ -97,6 +97,8 @@ import com.example.shareadd.events.EventTypes
 import com.example.shareadd.events.InvitationPreviewDialog
 import com.example.shareadd.events.PlaceQrDialog
 import com.example.shareadd.events.ShareEventSaver
+import com.example.shareadd.events.BUILTIN_PLACE_DETAILED
+import com.example.shareadd.events.BUILTIN_PLACE_SHORT
 import com.example.shareadd.events.TemplateManagerDialog
 import com.example.shareadd.events.defaultTemplateFor
 import com.example.shareadd.events.eventsPageItems
@@ -758,6 +760,11 @@ fun ShareAddScreen(
     var importMode by remember { mutableStateOf(ImportMode.SKIP_DUPLICATES) }
     var detailsPlace by remember { mutableStateOf<Place?>(null) }
     var shareOptionsPlace by remember { mutableStateOf<Place?>(null) }
+    // place-sharing template last used on this device (null = built-in detailed)
+    var placeTemplateId by remember { mutableStateOf(loadPlaceTemplateId(context)) }
+
+    /** Text of a place share outside the share dialog (share with images, QR): the last used place template. */
+    fun placeText(place: Place): String = placeShareText(place, arabic, placeShareTemplate(customTemplates, arabic, placeTemplateId).body)
     var deletePlaceId by remember { mutableStateOf<String?>(null) }
 
     var newCategoryAr by remember { mutableStateOf("") }
@@ -1039,31 +1046,37 @@ fun ShareAddScreen(
     }
 
     if (shareOptionsPlace != null) {
-        ShareOptionsDialog(
+        fun rememberTemplate(id: String) {
+            placeTemplateId = id
+            savePlaceTemplateId(context, id)
+        }
+        PlaceShareDialog(
             place = shareOptionsPlace!!,
             arabic = arabic,
+            customTemplates = customTemplates,
+            initialTemplateId = placeTemplateId,
             onDismiss = { shareOptionsPlace = null },
-            onShortShare = {
-                sharePlace(context, shareOptionsPlace!!, arabic, includeImages = false, detailed = false)
+            onShareText = { text, id ->
+                rememberTemplate(id)
+                sharePlace(context, shareOptionsPlace!!, arabic, includeImages = false, text = text)
                 shareOptionsPlace = null
             },
-            onDetailedShare = {
-                sharePlace(context, shareOptionsPlace!!, arabic, includeImages = false, detailed = true)
-                shareOptionsPlace = null
-            },
-            onCopyText = {
-                copyText(context, buildShareText(shareOptionsPlace!!, arabic, detailed = true))
+            onCopyText = { text, id ->
+                rememberTemplate(id)
+                copyText(context, text)
                 Toast.makeText(context, if (arabic) "تم نسخ نص المشاركة" else "Share text copied", Toast.LENGTH_SHORT).show()
                 shareOptionsPlace = null
             },
-            onShareImages = {
-                sharePlace(context, shareOptionsPlace!!, arabic, includeImages = true, detailed = true)
+            onShareImages = { text, id ->
+                rememberTemplate(id)
+                sharePlace(context, shareOptionsPlace!!, arabic, includeImages = true, text = text)
                 shareOptionsPlace = null
             },
             onShowQr = {
                 qrPlaceId = shareOptionsPlace!!.id
                 shareOptionsPlace = null
-            }
+            },
+            onManageTemplates = { if (!storageBlocked()) showTemplateManager = true }
         )
     }
 
@@ -1075,7 +1088,7 @@ fun ShareAddScreen(
             PlaceQrDialog(
                 arabic = arabic,
                 link = place.url,
-                shareTextValue = buildShareText(place, arabic, detailed = true),
+                shareTextValue = placeText(place),
                 onClose = { qrPlaceId = null }
             )
         }
@@ -1933,7 +1946,7 @@ fun ShareAddScreen(
                                 shareOptionsPlace = place
                             },
                             onShareImages = {
-                                sharePlace(context, place, arabic, includeImages = true)
+                                sharePlace(context, place, arabic, includeImages = true, text = placeText(place))
                             },
                             onDetails = {
                                 detailsPlace = place
@@ -3885,44 +3898,10 @@ fun sharePlacesList(context: Context, places: List<Place>, arabic: Boolean, titl
     )
 }
 
+/** Text of a place from the built-in detailed / short place template (nothing is added outside the template). */
 fun buildShareText(place: Place, arabic: Boolean, detailed: Boolean): String {
-    val categoryText = if (arabic) place.categoryAr else place.categoryEn
-    val ratingText = if (place.rating == 0) "-" else "${place.rating}/5"
-    val noteLine = if (place.description.isNotBlank()) "📝 ${place.description}\n" else ""
-
-    return if (arabic) {
-        if (detailed) {
-            "حفظت هذا المكان في ShareAdd:\n\n" +
-                    "📍 ${place.placeName}\n" +
-                    "⭐ $ratingText\n" +
-                    "🗂 $categoryText\n" +
-                    noteLine +
-                    "🗺 ${place.url}\n\n" +
-                    "تمت المشاركة عبر ShareAdd\n" +
-                    "تصميم وتطوير المهندس علي حسين الحنابي"
-        } else {
-            "📍 ${place.placeName}\n" +
-                    "⭐ $ratingText\n" +
-                    "🗺 ${place.url}\n\n" +
-                    "تمت المشاركة عبر ShareAdd"
-        }
-    } else {
-        if (detailed) {
-            "I saved this place on ShareAdd:\n\n" +
-                    "📍 ${place.placeName}\n" +
-                    "⭐ $ratingText\n" +
-                    "🗂 $categoryText\n" +
-                    noteLine +
-                    "🗺 ${place.url}\n\n" +
-                    "Shared via ShareAdd\n" +
-                    "Designed & developed by Eng. Ali Hussain Al-Hanabi"
-        } else {
-            "📍 ${place.placeName}\n" +
-                    "⭐ $ratingText\n" +
-                    "🗺 ${place.url}\n\n" +
-                    "Shared via ShareAdd"
-        }
-    }
+    val id = if (detailed) BUILTIN_PLACE_DETAILED else BUILTIN_PLACE_SHORT
+    return placeShareText(place, arabic, placeShareTemplate(emptyList(), arabic, id).body)
 }
 
 fun sharePlace(
@@ -3930,9 +3909,11 @@ fun sharePlace(
     place: Place,
     arabic: Boolean,
     includeImages: Boolean,
-    detailed: Boolean = true
+    detailed: Boolean = true,
+    /** the exact text to share (from the share dialog); null = the built-in template text */
+    text: String? = null
 ) {
-    val text = buildShareText(place, arabic, detailed)
+    @Suppress("NAME_SHADOWING") val text = text ?: buildShareText(place, arabic, detailed)
 
     if (includeImages && place.images.isNotEmpty()) {
         val uriList = ArrayList<Uri>()
@@ -4023,109 +4004,6 @@ fun BrandLogo(size: Int = 76) {
             }
         }
     }
-}
-
-@Composable
-fun ShareOptionsDialog(
-    place: Place,
-    arabic: Boolean,
-    onDismiss: () -> Unit,
-    onShortShare: () -> Unit,
-    onDetailedShare: () -> Unit,
-    onCopyText: () -> Unit,
-    onShareImages: () -> Unit,
-    onShowQr: () -> Unit
-) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = {
-            Text(
-                text = if (arabic) "مشاركة المكان" else "Share Place",
-                modifier = Modifier.fillMaxWidth(),
-                textAlign = TextAlign.Center,
-                fontWeight = FontWeight.Bold
-            )
-        },
-        text = {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Surface(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(24.dp),
-                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.70f),
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.18f))
-                ) {
-                    Column(
-                        modifier = Modifier.padding(16.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-                        Text(
-                            text = "📍 ${place.placeName}",
-                            style = MaterialTheme.typography.titleLarge,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.primary,
-                            textAlign = TextAlign.Center
-                        )
-                        Spacer(Modifier.height(6.dp))
-                        Text(
-                            text = if (arabic)
-                                "اختر طريقة المشاركة المناسبة."
-                            else
-                                "Choose the best sharing style.",
-                            textAlign = TextAlign.Center,
-                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.78f)
-                        )
-                    }
-                }
-
-                Spacer(Modifier.height(14.dp))
-
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(
-                        onClick = onDetailedShare,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(if (arabic) "مشاركة مفصلة" else "Detailed Share")
-                    }
-
-                    OutlinedButton(
-                        onClick = onShortShare,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(if (arabic) "مشاركة مختصرة" else "Short Share")
-                    }
-
-                    OutlinedButton(
-                        onClick = onCopyText,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(if (arabic) "نسخ نص المشاركة" else "Copy Share Text")
-                    }
-
-                    if (place.images.isNotEmpty()) {
-                        OutlinedButton(
-                            onClick = onShareImages,
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text(if (arabic) "مشاركة مع الصور" else "Share With Images")
-                        }
-                    }
-
-                    OutlinedButton(
-                        onClick = onShowQr,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(if (arabic) "رمز QR للرابط" else "QR Code for the Link")
-                    }
-                }
-            }
-        },
-        confirmButton = {},
-        dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text(if (arabic) "إغلاق" else "Close")
-            }
-        }
-    )
 }
 
 @Composable
