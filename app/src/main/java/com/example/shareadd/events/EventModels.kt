@@ -49,6 +49,11 @@ data class ShareEvent(
     val time: String = "",
     /** HH:mm (24h), or empty — door opening time, independent of the event / prayer time */
     val openingTime: String = "",
+    /**
+     * HH:mm (24h), or empty — iqama time of a prayer event, independent of [time] (the prayer / prayer-time entry).
+     * Missing in events saved before this field existed → empty; it is never derived from [time].
+     */
+    val iqamaTime: String = "",
     val prayer: String = "",
     val imamLine: String = "",
     val description: String = "",
@@ -105,6 +110,8 @@ fun writeEvent(out: JsonOut, e: ShareEvent) {
     out.field("date", e.date)
     out.field("time", e.time)
     out.field("openingTime", e.openingTime)
+    // written only when set, so events without it keep exactly their previous JSON
+    if (e.iqamaTime.isNotBlank()) out.field("iqamaTime", e.iqamaTime)
     out.field("prayer", e.prayer)
     out.field("imamLine", e.imamLine)
     out.field("description", e.description)
@@ -136,6 +143,7 @@ fun readEvent(input: JsonIn): ShareEvent {
             "date" -> e = e.copy(date = input.nextScalarAsText())
             "time" -> e = e.copy(time = input.nextScalarAsText())
             "openingTime" -> e = e.copy(openingTime = input.nextScalarAsText())
+            "iqamaTime" -> e = e.copy(iqamaTime = input.nextScalarAsText())
             "prayer" -> e = e.copy(prayer = input.nextScalarAsText())
             "imamLine" -> e = e.copy(imamLine = input.nextScalarAsText())
             "description" -> e = e.copy(description = input.nextScalarAsText())
