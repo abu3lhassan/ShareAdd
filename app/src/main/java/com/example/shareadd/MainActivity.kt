@@ -3856,39 +3856,34 @@ fun suggestCategoryFromText(
     }
 }
 
-fun sharePlacesList(context: Context, places: List<Place>, arabic: Boolean, title: String) {
-    val header = if (arabic) {
-        "قائمة من ShareAdd\n\n" +
-                "📍 $title\n" +
-                "عدد الأماكن: ${places.size}\n\n"
-    } else {
-        "A list from ShareAdd\n\n" +
-                "📍 $title\n" +
-                "Places count: ${places.size}\n\n"
-    }
+/**
+ * Text of a list of places (all / currently shown), in the given order. Only the list title, the count and the places
+ * themselves: nothing about ShareAdd is added before or after. An empty short address leaves no line.
+ */
+fun placesListText(places: List<Place>, arabic: Boolean, title: String): String {
+    val header = if (arabic) "📍 $title\nعدد الأماكن: ${places.size}" else "📍 $title\nPlaces count: ${places.size}"
 
     val body = places.mapIndexed { index, place ->
         val categoryText = if (arabic) place.categoryAr else place.categoryEn
         val ratingText = if (place.rating == 0) "-" else "${place.rating}/5"
+        val addressLine = if (place.title.isNotBlank()) "📍 ${place.title}\n" else ""
         val noteLine = if (place.description.isNotBlank()) "📝 ${place.description}\n" else ""
 
         "${index + 1}. ${place.placeName}\n" +
-                "📍 ${place.title}\n" +
+                addressLine +
                 "🗂 $categoryText\n" +
                 "⭐ $ratingText\n" +
                 noteLine +
                 "🗺 ${place.url}"
     }.joinToString("\n\n────────────\n\n")
 
-    val footer = if (arabic) {
-        "\n\nتمت المشاركة عبر ShareAdd\nتصميم وتطوير المهندس علي حسين الحنابي"
-    } else {
-        "\n\nShared via ShareAdd\nDesigned & developed by Eng. Ali Hussain Al-Hanabi"
-    }
+    return header + "\n\n" + body
+}
 
+fun sharePlacesList(context: Context, places: List<Place>, arabic: Boolean, title: String) {
     val intent = Intent(Intent.ACTION_SEND)
     intent.type = "text/plain"
-    intent.putExtra(Intent.EXTRA_TEXT, header + body + footer)
+    intent.putExtra(Intent.EXTRA_TEXT, placesListText(places, arabic, title))
 
     context.startActivity(
         Intent.createChooser(

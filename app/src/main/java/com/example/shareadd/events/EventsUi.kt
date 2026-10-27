@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -1447,6 +1448,8 @@ private fun TemplateEditorDialog(arabic: Boolean, initial: InvitationTemplate, o
     var body by rememberSaveable(stateSaver = TextFieldValue.Saver) { mutableStateOf(TextFieldValue(initial.body)) }
     var error by rememberSaveable { mutableStateOf("") }
     var showFields by remember { mutableStateOf(false) }
+    // the type row starts scrolled to the template's own type, so the current choice is always visible
+    val typeRowState = rememberLazyListState(initialFirstVisibleItemIndex = TEMPLATE_TYPES.indexOf(initial.type).coerceAtLeast(0))
     val known = variablesFor(type)
     val unknown = unknownTemplateVariables(body.text, known)
     val sample = sampleRender(body.text, type, language == "en")
@@ -1468,7 +1471,7 @@ private fun TemplateEditorDialog(arabic: Boolean, initial: InvitationTemplate, o
                     OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text(if (arabic) "اسم القالب" else "Template name") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
                     Spacer(Modifier.height(8.dp))
                     Text(if (arabic) "نوع القالب" else "Template type", style = MaterialTheme.typography.bodySmall)
-                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    LazyRow(state = typeRowState, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         items(TEMPLATE_TYPES) { t -> FilterChip(selected = type == t, onClick = { type = t }, label = { Text(eventTypeLabel(t, arabic)) }) }
                     }
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {

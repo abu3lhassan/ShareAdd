@@ -130,6 +130,26 @@ class SharingTemplatesTest {
         assertEquals("tpl-p", placeShareTemplate(custom, true, "tpl-p").id)
     }
 
+    @Test
+    fun placeListShareHasNoShareAddIntroOrFooterAndKeepsOrderAndAddresses() {
+        val a = place().copy(id = "pl-a", placeName = "أ", title = "حي أ")
+        val b = place().copy(id = "pl-b", placeName = "ب", title = "")
+        val c = place().copy(id = "pl-c", placeName = "ج", title = "حي ج")
+        val shown = listOf(c, a)                      // a filter that shows two places, in the shown order
+        val text = placesListText(shown, arabic = true, title = "القائمة الحالية")
+        assertFalse(text.contains("ShareAdd"))
+        assertFalse(text.contains("الحنابي"))
+        assertTrue(text.startsWith("📍 القائمة الحالية\nعدد الأماكن: 2\n\n1. ج\n📍 حي ج\n"))
+        assertTrue(text.contains("\n\n────────────\n\n2. أ\n📍 حي أ\n"))
+        assertFalse(text.contains("4321"))            // private notes are never listed
+        val all = placesListText(listOf(a, b, c), arabic = true, title = "كل العناوين")
+        assertEquals(3, Regex("""(?m)^\d+\. """).findAll(all).count())
+        assertTrue(all.contains("2. ب\n🗂 أماكن"))      // empty short address: no empty line
+        // text written by the user inside a place's own fields is kept as is, even if it names ShareAdd
+        val own = placesListText(listOf(a.copy(description = "تمت المشاركة عبر ShareAdd")), true, "x")
+        assertTrue(own.contains("📝 تمت المشاركة عبر ShareAdd"))
+    }
+
     // ------------------------------------------------------------------ labels, iqama, day/date, notices
 
     @Test
