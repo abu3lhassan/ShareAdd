@@ -13,6 +13,7 @@ import com.example.shareadd.events.formatEventTime
 import com.example.shareadd.events.invitationValues
 import com.example.shareadd.events.renderEvent
 import com.example.shareadd.events.renderInvitation
+import com.example.shareadd.events.seedDefaultTemplates
 import com.example.shareadd.events.templateChoices
 import com.example.shareadd.events.unknownTemplateVariables
 import com.google.zxing.BinaryBitmap
@@ -99,7 +100,7 @@ class InvitationAndQrTest {
             assertTrue(unknownTemplateVariables(it.bodyAr).isEmpty())
             assertTrue(unknownTemplateVariables(it.bodyEn).isEmpty())
         }
-        assertEquals(4, templateChoices(emptyList(), "ar", true).size)
+        assertEquals(4, templateChoices(seedDefaultTemplates(emptyList()), "ar").size)
     }
 
     @Test

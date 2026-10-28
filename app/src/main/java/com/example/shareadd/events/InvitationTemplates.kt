@@ -100,7 +100,8 @@ fun renderInvitation(body: String, values: Map<String, String>, knownVariables: 
     return RenderResult(text, unknown)
 }
 
-// ------------------------------------------------------------------ built-in templates (Arabic + English)
+// ------------------------------------------------------------------ built-in template definitions (Arabic + English)
+// Only the first content of the stored default templates (see DEFAULT_TEMPLATE_SEEDS); never rendered directly.
 
 const val BUILTIN_PRAYER = "builtin-prayer"
 const val BUILTIN_FAMILY = "builtin-family"
@@ -287,21 +288,102 @@ Shared via ShareAdd
     )
 )
 
-/** A template that can be chosen: a built-in one (in the requested language) or a custom one. */
-data class TemplateChoice(val id: String, val name: String, val type: String, val body: String, val builtIn: Boolean)
+// ------------------------------------------------------------------ default templates: seeded once into the stored templates
 
-/** Invitation templates for events (place-sharing templates are never mixed in). */
-fun templateChoices(custom: List<InvitationTemplate>, language: String, arabicUi: Boolean): List<TemplateChoice> =
-    BUILT_IN_TEMPLATES.map {
-        TemplateChoice(it.id, if (arabicUi) it.nameAr else it.nameEn, it.type, if (language == "en") it.bodyEn else it.bodyAr, true)
-    } + custom.filter { it.type != PLACE_TEMPLATE_TYPE }.map { TemplateChoice(it.id, it.name, it.type, it.body, false) }
+/*
+ * The definitions above are only the first content of the default templates. They are copied once into the stored
+ * templates (one per definition and language, with a stable id); from then on the stored copy is the template: it is
+ * edited in place like any other template, and choosing, rendering and sharing always read the stored templates.
+ */
 
-/** Place-sharing templates: the built-in ones in the share language, then the user's own place templates. */
-fun placeTemplateChoices(custom: List<InvitationTemplate>, language: String, arabicUi: Boolean): List<TemplateChoice> =
-    BUILT_IN_PLACE_TEMPLATES.map {
-        TemplateChoice(it.id, if (arabicUi) it.nameAr else it.nameEn, it.type, if (language == "en") it.bodyEn else it.bodyAr, true)
-    } + custom.filter { it.type == PLACE_TEMPLATE_TYPE }.map { TemplateChoice(it.id, it.name, it.type, it.body, false) }
+/** Stable id of a seeded default template: "default-prayer-ar", "default-place-short-en", ... */
+fun defaultTemplateId(builtInId: String, language: String): String =
+    "default-" + builtInId.removePrefix("builtin-") + if (language == "en") "-en" else "-ar"
 
+private val SEED_DEFINITIONS = BUILT_IN_TEMPLATES + BUILT_IN_PLACE_TEMPLATES
+
+/** The default templates as first stored (Arabic and English of each definition, in this order). */
+val DEFAULT_TEMPLATE_SEEDS: List<InvitationTemplate> = SEED_DEFINITIONS.flatMap { b ->
+    listOf(
+        InvitationTemplate(defaultTemplateId(b.id, "ar"), b.nameAr, b.type, "ar", b.bodyAr),
+        InvitationTemplate(defaultTemplateId(b.id, "en"), b.nameEn, b.type, "en", b.bodyEn)
+    )
+}
+
+/** seeded default id → built-in definition id */
+private val SEED_DEFINITION_OF: Map<String, String> =
+    SEED_DEFINITIONS.flatMap { b -> listOf(defaultTemplateId(b.id, "ar") to b.id, defaultTemplateId(b.id, "en") to b.id) }.toMap()
+
+private val SEED_ORDER: Map<String, Int> = DEFAULT_TEMPLATE_SEEDS.mapIndexed { i, t -> t.id to i }.toMap()
+
+fun isDefaultTemplate(id: String): Boolean = id in SEED_DEFINITION_OF
+
+/** Language of a seeded default ("ar" / "en"), fixed by its id; null for any other template. */
+fun defaultTemplateLanguage(id: String): String? = if (isDefaultTemplate(id)) if (id.endsWith("-en")) "en" else "ar" else null
+
+/**
+ * The stored templates with every missing default template added (matched by id). Stored templates — edited defaults
+ * and the user's own templates — are kept exactly as they are and in their order, so running this again changes nothing.
+ * Returns the same list instance when nothing is missing.
+ */
+fun seedDefaultTemplates(stored: List<InvitationTemplate>): List<InvitationTemplate> {
+    val ids = stored.mapTo(HashSet()) { it.id }
+    val missing = DEFAULT_TEMPLATE_SEEDS.filter { it.id !in ids }
+    return if (missing.isEmpty()) stored else missing + stored
+}
+
+/**
+ * The stored template an id refers to in [language]: the id of a built-in definition (events and settings saved before
+ * the defaults were stored: "builtin-prayer") or of a default in the other language maps to the default of [language];
+ * any other id stays as it is.
+ */
+fun templateIdFor(id: String, language: String): String {
+    val definition = SEED_DEFINITION_OF[id] ?: id.takeIf { d -> SEED_DEFINITIONS.any { it.id == d } } ?: return id
+    return defaultTemplateId(definition, language)
+}
+
+/** A template that can be chosen; [isDefault] = one of the seeded default templates (edited or not). */
+data class TemplateChoice(val id: String, val name: String, val type: String, val body: String, val isDefault: Boolean)
+
+private fun InvitationTemplate.toChoice() = TemplateChoice(id, name, type, body, isDefaultTemplate(id))
+
+/** Stored templates for a list: the defaults first (in their seed order), then the user's own templates in their order. */
+fun orderedTemplates(templates: List<InvitationTemplate>): List<InvitationTemplate> =
+    templates.filter { isDefaultTemplate(it.id) }.sortedBy { SEED_ORDER[it.id] } + templates.filterNot { isDefaultTemplate(it.id) }
+
+/** Invitation templates for an event in [language]: the stored defaults of that language, then the user's own event templates. */
+fun templateChoices(templates: List<InvitationTemplate>, language: String): List<TemplateChoice> =
+    orderedTemplates(templates)
+        .filter { it.type != PLACE_TEMPLATE_TYPE && (defaultTemplateLanguage(it.id) ?: language) == language }
+        .map { it.toChoice() }
+
+/** Place-sharing templates in [language]: the stored place defaults of that language, then the user's own place templates. */
+fun placeTemplateChoices(templates: List<InvitationTemplate>, language: String): List<TemplateChoice> =
+    orderedTemplates(templates)
+        .filter { it.type == PLACE_TEMPLATE_TYPE && (defaultTemplateLanguage(it.id) ?: language) == language }
+        .map { it.toChoice() }
+
+/** The template actually used; [fallback] = the requested template no longer exists and this default is used instead. */
+data class ResolvedTemplate(val template: TemplateChoice, val fallback: Boolean)
+
+private fun resolveIn(choices: List<TemplateChoice>, requestedId: String, language: String, defaultDefinition: String): ResolvedTemplate {
+    val wanted = templateIdFor(requestedId, language)
+    choices.firstOrNull { it.id == wanted }?.let { return ResolvedTemplate(it, false) }
+    val defaultId = defaultTemplateId(defaultDefinition, language)
+    // the stored default; its first content only if the stored copy is missing (storage could not be read)
+    val default = choices.firstOrNull { it.id == defaultId } ?: DEFAULT_TEMPLATE_SEEDS.first { it.id == defaultId }.toChoice()
+    return ResolvedTemplate(default, fallback = requestedId.isNotBlank())
+}
+
+/** The stored template of an event: its own [templateId] when it still exists, else the stored default of its [type]. */
+fun resolveEventTemplate(templates: List<InvitationTemplate>, templateId: String, language: String, type: String): ResolvedTemplate =
+    resolveIn(templateChoices(templates, language), templateId, language, defaultTemplateFor(type))
+
+/** The stored place-sharing template [templateId] when it still exists, else the stored detailed default. */
+fun resolvePlaceTemplate(templates: List<InvitationTemplate>, templateId: String?, language: String): ResolvedTemplate =
+    resolveIn(placeTemplateChoices(templates, language), templateId.orEmpty(), language, BUILTIN_PLACE_DETAILED)
+
+/** Built-in definition of the default template of an event type (use [defaultTemplateId] for the stored template). */
 fun defaultTemplateFor(type: String): String = when (type) {
     EventTypes.PRAYER -> BUILTIN_PRAYER
     EventTypes.FAMILY -> BUILTIN_FAMILY

@@ -31,11 +31,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDirection
 import androidx.compose.ui.unit.dp
-import com.example.shareadd.events.BUILTIN_PLACE_DETAILED
 import com.example.shareadd.events.InvitationTemplate
 import com.example.shareadd.events.TemplateChoice
 import com.example.shareadd.events.placeShareValues
 import com.example.shareadd.events.placeTemplateChoices
+import com.example.shareadd.events.resolvePlaceTemplate
 import com.example.shareadd.events.renderPlaceShare
 
 /*
@@ -44,11 +44,9 @@ import com.example.shareadd.events.renderPlaceShare
  * the place's private notes are never part of a share.
  */
 
-/** The template to use: [templateId] if it is still available, else the built-in detailed template. */
-fun placeShareTemplate(customTemplates: List<InvitationTemplate>, arabic: Boolean, templateId: String?): TemplateChoice {
-    val choices = placeTemplateChoices(customTemplates, if (arabic) "ar" else "en", arabic)
-    return choices.firstOrNull { it.id == templateId } ?: choices.first { it.id == BUILTIN_PLACE_DETAILED }
-}
+/** The stored template to use: [templateId] if it is still available, else the stored detailed default. */
+fun placeShareTemplate(templates: List<InvitationTemplate>, arabic: Boolean, templateId: String?): TemplateChoice =
+    resolvePlaceTemplate(templates, templateId, if (arabic) "ar" else "en").template
 
 /** Share text of [place] with [templateBody]; [notes] = notices for this share only. */
 fun placeShareText(place: Place, arabic: Boolean, templateBody: String, notes: String = ""): String =
@@ -90,7 +88,7 @@ fun PlaceShareDialog(
     onShowQr: () -> Unit,
     onManageTemplates: () -> Unit
 ) {
-    val choices = placeTemplateChoices(customTemplates, if (arabic) "ar" else "en", arabic)
+    val choices = placeTemplateChoices(customTemplates, if (arabic) "ar" else "en")
     var templateId by rememberSaveable(place.id) { mutableStateOf(placeShareTemplate(customTemplates, arabic, initialTemplateId).id) }
     var notes by rememberSaveable(place.id) { mutableStateOf("") }
     var editedText by rememberSaveable(place.id) { mutableStateOf<String?>(null) }

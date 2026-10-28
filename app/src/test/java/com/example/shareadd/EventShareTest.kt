@@ -218,24 +218,26 @@ class EventShareTest {
     }
 
     @Test
-    fun handEditedTextIsNeverRebuiltOnlyItsUniqueTimeIsReplacedForTheShare() {
+    fun handEditedTextIsKeptExactlyAndValueChangesAreOnlyReported() {
         val custom = "تفضلوا لصلاة العشاء الساعة 6:15 م\nالباب يفتح 5:50 م\nرقم البيت 16:15"
         val e = prayerEvent().copy(invitationText = custom, textEdited = true)
+        // a value change never rewrites a hand-edited text (not even a time that appears once): it is reported instead
         val r = shareInvitationText(e, ShareTimes("18:20", "17:50"), prayerBody)
-        assertEquals(ShareTextSource.TIMES_REPLACED, r.source)
-        assertEquals("تفضلوا لصلاة العشاء الساعة 6:20 م\nالباب يفتح 5:50 م\nرقم البيت 16:15", r.text)
+        assertEquals(ShareTextSource.MANUAL_KEPT, r.source)
+        assertEquals(custom, r.text)
+        assertTrue(r.valuesDiffer)
+        // nothing changed: no warning
+        assertFalse(shareInvitationText(e, savedTimes(e), prayerBody).valuesDiffer)
+        // the explicit, confirmed update rebuilds it from the template with the latest values
+        val updated = shareInvitationText(e, ShareTimes("18:20", "17:50"), prayerBody, regenerate = true)
+        assertEquals(ShareTextSource.TEMPLATE, updated.source)
+        assertTrue(updated.text.contains("⏰ وقت الصلاة: 6:20 م"))
         assertEquals("stored hand-edited text unchanged", custom, e.invitationText)
-
-        // cannot be placed safely: the time is not in the text / a line would have to be removed / ambiguous
-        assertEquals(ShareTextSource.TIMES_NOT_APPLIED, shareInvitationText(e.copy(invitationText = "بدون وقت"), ShareTimes("18:20", "17:50"), prayerBody).source)
+        // explicit save without the update keeps the hand-edited text as it was
         val cleared = shareInvitationText(e, ShareTimes("18:15", ""), prayerBody)
-        assertEquals(ShareTextSource.TIMES_NOT_APPLIED, cleared.source)
-        assertEquals(custom, cleared.text)
-        val same = prayerEvent(time = "18:00", opening = "18:00").let { it.copy(invitationText = "6:00 م", textEdited = true) }
-        assertEquals(ShareTextSource.TIMES_NOT_APPLIED, shareInvitationText(same, ShareTimes("18:10", "18:00"), prayerBody).source)
-        // explicit update with text that could not take the times keeps the text as it was
         val kept = applyShareTimes(e, ShareTimes("18:15", ""), cleared, now = 5)
         assertEquals(custom, kept.invitationText)
+        assertTrue(kept.textEdited)
         assertEquals("", kept.openingTime)
     }
 
@@ -324,30 +326,19 @@ class EventShareTest {
     }
 
     @Test
-    fun handEditedTextDateIsReplacedOnlyWhenUnambiguous() { // D10, D11
+    fun handEditedTextKeepsItsDateUntilTheExplicitUpdate() { // D10, D11
         val custom = "صلاة العشاء يوم الثلاثاء 20 أكتوبر 2026\nالساعة 6:15 م"
         val e = prayerEvent().copy(invitationText = custom, textEdited = true)
         val r = shareInvitationText(e, ShareTimes("18:15", "17:50", "2026-10-25"), prayerBody)
-        assertEquals(ShareTextSource.TIMES_REPLACED, r.source)
-        assertEquals("صلاة العشاء يوم الأحد 25 أكتوبر 2026\nالساعة 6:15 م", r.text)
-        // weekday only (no date line) is still safe
-        val dayOnly = e.copy(invitationText = "نلقاكم الثلاثاء الساعة 6:15 م")
-        assertEquals("نلقاكم الأحد الساعة 6:15 م", shareInvitationText(dayOnly, ShareTimes("18:15", "17:50", "2026-10-25"), prayerBody).text)
-        // date + time together
-        val both = shareInvitationText(e, ShareTimes("18:40", "17:50", "2026-10-25"), prayerBody)
-        assertEquals("صلاة العشاء يوم الأحد 25 أكتوبر 2026\nالساعة 6:40 م", both.text)
-
-        // unsafe: weekday twice / no date at all → the saved text unchanged, with the warning source
-        val twice = e.copy(invitationText = "الثلاثاء ثم الثلاثاء القادم")
-        val t = shareInvitationText(twice, ShareTimes("18:15", "17:50", "2026-10-25"), prayerBody)
-        assertEquals(ShareTextSource.TIMES_NOT_APPLIED, t.source)
-        assertEquals(twice.invitationText, t.text)
-        val none = e.copy(invitationText = "تفضلوا الساعة 6:15 م")
-        assertEquals(ShareTextSource.TIMES_NOT_APPLIED, shareInvitationText(none, ShareTimes("18:15", "17:50", "2026-10-25"), prayerBody).source)
-        // explicit update with text that could not take the date: date saved, text kept
-        val kept = applyShareTimes(none, ShareTimes("18:15", "17:50", "2026-10-25"), shareInvitationText(none, ShareTimes("18:15", "17:50", "2026-10-25"), prayerBody), 9)
+        assertEquals(ShareTextSource.MANUAL_KEPT, r.source)
+        assertEquals(custom, r.text)
+        assertTrue(r.valuesDiffer)
+        val updated = shareInvitationText(e, ShareTimes("18:15", "17:50", "2026-10-25"), prayerBody, regenerate = true)
+        assertTrue(updated.text.contains("— الأحد"))
+        // explicit save of the date without the update: date saved, text kept
+        val kept = applyShareTimes(e, ShareTimes("18:15", "17:50", "2026-10-25"), r, 9)
         assertEquals("2026-10-25", kept.date)
-        assertEquals(none.invitationText, kept.invitationText)
+        assertEquals(custom, kept.invitationText)
         assertEquals("stored hand-edited text unchanged", custom, e.invitationText)
     }
 

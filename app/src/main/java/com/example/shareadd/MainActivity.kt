@@ -101,6 +101,7 @@ import com.example.shareadd.events.BUILTIN_PLACE_DETAILED
 import com.example.shareadd.events.BUILTIN_PLACE_SHORT
 import com.example.shareadd.events.TemplateManagerDialog
 import com.example.shareadd.events.defaultTemplateFor
+import com.example.shareadd.events.defaultTemplateId
 import com.example.shareadd.events.eventsPageItems
 import com.example.shareadd.events.newEventId
 import com.example.shareadd.events.ShareEvent
@@ -108,6 +109,7 @@ import com.example.shareadd.events.loadEventsChecked
 import com.example.shareadd.events.loadTemplatesChecked
 import com.example.shareadd.events.saveEvents
 import com.example.shareadd.events.saveTemplates
+import com.example.shareadd.events.seedDefaultTemplates
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -624,7 +626,8 @@ fun ShareAddScreen(
     var places by remember { mutableStateOf(placesLoad.value) }
     var categories by remember { mutableStateOf(categoriesLoad.value) }
     var events by remember { mutableStateOf(eventsLoad.value) }
-    var customTemplates by remember { mutableStateOf(templatesLoad.value) }
+    // all stored templates: the default templates are seeded into them once (missing ones only), then saved like any other
+    var customTemplates by remember { mutableStateOf(if (templatesLoad.ok) seedDefaultTemplates(templatesLoad.value) else templatesLoad.value) }
 
     // a long operation (export / import / copying images) runs in the background; only one at a time
     var busyText by remember { mutableStateOf<String?>(null) }
@@ -830,6 +833,14 @@ fun ShareAddScreen(
     }
 
     LaunchedEffect(customTemplates) {
+        // an import that replaced the templates may not contain the defaults: add the missing ones back (never duplicated)
+        if (templatesLoad.ok) {
+            val seeded = seedDefaultTemplates(customTemplates)
+            if (seeded !== customTemplates) {
+                customTemplates = seeded
+                return@LaunchedEffect
+            }
+        }
         if (storageWritable && ImportSession.canAutoSave()) saveTemplates(context, customTemplates)
     }
 
@@ -1146,7 +1157,7 @@ fun ShareAddScreen(
     if (showTemplateManager) {
         TemplateManagerDialog(
             arabic = arabic,
-            customTemplates = customTemplates,
+            templates = customTemplates,
             onSaveTemplate = { t ->
                 customTemplates = if (customTemplates.any { it.id == t.id }) customTemplates.map { if (it.id == t.id) t else it } else customTemplates + t
             },
@@ -1907,7 +1918,8 @@ fun ShareAddScreen(
                                 editingEvent = ShareEvent(
                                     id = newEventId(),
                                     type = EventTypes.GENERAL,
-                                    templateId = defaultTemplateFor(EventTypes.GENERAL),
+                                    // the stored default template of the type, in the invitation language
+                                    templateId = defaultTemplateId(defaultTemplateFor(EventTypes.GENERAL), if (arabic) "ar" else "en"),
                                     language = if (arabic) "ar" else "en",
                                     // new events: weekday only; the date line is opt-in
                                     showDate = false,
