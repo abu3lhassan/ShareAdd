@@ -28,6 +28,7 @@ import com.example.shareadd.events.placeTemplateChoices
 import com.example.shareadd.events.renderEvent
 import com.example.shareadd.events.savedTimes
 import com.example.shareadd.events.shareInvitationText
+import com.example.shareadd.events.seedDefaultTemplates
 import com.example.shareadd.events.templateChoices
 import com.example.shareadd.events.templatesToJson
 import org.junit.Assert.assertEquals
@@ -123,11 +124,13 @@ class SharingTemplatesTest {
             InvitationTemplate("tpl-p", "مكاني", PLACE_TEMPLATE_TYPE, "ar", "{place_name}"),
             InvitationTemplate("tpl-e", "دعوتي", EventTypes.GENERAL, "ar", "{title}")
         )
-        assertEquals(listOf(BUILTIN_PLACE_DETAILED, BUILTIN_PLACE_SHORT, "tpl-p"), placeTemplateChoices(custom, "ar", true).map { it.id })
-        assertFalse(templateChoices(custom, "ar", true).any { it.type == PLACE_TEMPLATE_TYPE })
-        // an unknown / deleted remembered template falls back to the detailed one
-        assertEquals(BUILTIN_PLACE_DETAILED, placeShareTemplate(custom, true, "tpl-deleted").id)
-        assertEquals("tpl-p", placeShareTemplate(custom, true, "tpl-p").id)
+        val stored = seedDefaultTemplates(custom)
+        assertEquals(listOf("default-place-detailed-ar", "default-place-short-ar", "tpl-p"), placeTemplateChoices(stored, "ar").map { it.id })
+        assertFalse(templateChoices(stored, "ar").any { it.type == PLACE_TEMPLATE_TYPE })
+        // an unknown / deleted remembered template falls back to the stored detailed one; an old built-in id still works
+        assertEquals("default-place-detailed-ar", placeShareTemplate(stored, true, "tpl-deleted").id)
+        assertEquals("default-place-short-en", placeShareTemplate(stored, false, BUILTIN_PLACE_SHORT).id)
+        assertEquals("tpl-p", placeShareTemplate(stored, true, "tpl-p").id)
     }
 
     @Test
@@ -261,26 +264,25 @@ class SharingTemplatesTest {
     fun handEditedTextIsNeverDamagedOrShownAsUpdated() { // E9
         val custom = "تفضلوا لصلاة العشائين الساعة 6:00 م\nالإقامة 6:10 م"
         val e = prayerEvent(iqama = "18:10").copy(invitationText = custom, textEdited = true)
-        // a unique saved iqama time can be replaced safely
-        val r = shareInvitationText(e, ShareTimes("18:00", "17:30", iqamaTime = "18:20"), prayerAr)
-        assertEquals(ShareTextSource.TIMES_REPLACED, r.source)
-        assertEquals("تفضلوا لصلاة العشائين الساعة 6:00 م\nالإقامة 6:20 م", r.text)
-        // new notices or another day display cannot be placed: the text stays as it was and is reported as not updated
-        listOf(ShareTimes("18:00", "17:30", notes = notices), ShareTimes("18:00", "17:30", showDate = true)).forEach {
+        // iqama, notices, day display, template: the hand-edited text stays exactly as written and the change is reported
+        listOf(
+            ShareTimes("18:00", "17:30", iqamaTime = "18:20"),
+            ShareTimes("18:00", "17:30", notes = notices),
+            ShareTimes("18:00", "17:30", showDate = true),
+            ShareTimes("18:00", "17:30", templateId = "tpl-x")
+        ).forEach {
             val n = shareInvitationText(e, it, prayerAr)
-            assertEquals(ShareTextSource.TIMES_NOT_APPLIED, n.source)
+            assertEquals(ShareTextSource.MANUAL_KEPT, n.source)
             assertEquals(custom, n.text)
+            assertTrue(n.valuesDiffer)
         }
-        // an iqama time that is not in the text cannot be placed either
-        val noIqama = prayerEvent().copy(invitationText = "تفضلوا الساعة 6:00 م", textEdited = true)
-        assertEquals(ShareTextSource.TIMES_NOT_APPLIED, shareInvitationText(noIqama, ShareTimes("18:00", "17:30", iqamaTime = "18:15"), prayerAr).source)
     }
 
     @Test
     fun anotherTemplateChosenForTheShareRebuildsTheTextFromIt() {
         val e = prayerEvent()
         val body = "{title}\nدخول الوقت: {time}\nالإقامة: {iqama_time}"
-        val r = shareInvitationText(e, ShareTimes("18:00", "17:30", iqamaTime = "18:15", templateId = "tpl-x"), prayerAr, body)
+        val r = shareInvitationText(e, ShareTimes("18:00", "17:30", iqamaTime = "18:15", templateId = "tpl-x"), body)
         assertEquals(ShareTextSource.TEMPLATE, r.source)
         assertEquals("صلاة العشائين جماعة\nدخول الوقت: 6:00 م\nالإقامة: 6:15 م", r.text)
         assertEquals(BUILTIN_PRAYER, e.templateId)

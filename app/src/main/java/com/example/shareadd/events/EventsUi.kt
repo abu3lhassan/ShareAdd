@@ -302,12 +302,20 @@ fun EventEditorDialog(
     var pickTime by rememberSaveable { mutableStateOf<String?>(null) } // "time", "opening" or "iqama"
     var confirmDiscard by rememberSaveable { mutableStateOf(false) }
     var pendingTemplateId by rememberSaveable { mutableStateOf<String?>(null) }
+    var confirmUpdateText by rememberSaveable { mutableStateOf(false) }
     var error by rememberSaveable { mutableStateOf("") }
 
-    val choices = templateChoices(customTemplates, draft.language, arabic)
-    val template = choices.firstOrNull { it.id == draft.templateId } ?: choices.first { it.id == defaultTemplateFor(draft.type) }
+    // the stored template is the source of truth; a missing one is replaced by the stored default of the type (shown below)
+    val resolved = resolveEventTemplate(customTemplates, draft.templateId, draft.language, draft.type)
+    val choices = templateChoices(customTemplates, draft.language)
+    val template = resolved.template
     val rendered = renderEvent(draft, template.body)
-    val shownText = if (draft.textEdited) draft.invitationText else rendered.text
+    // text the template gave when the user edited the invitation by hand: a later value change makes the edit out of date
+    var editedFrom by rememberSaveable {
+        mutableStateOf(if (initial.textEdited) renderEvent(initial, resolveEventTemplate(customTemplates, initial.templateId, initial.language, initial.type).template.body).text else "")
+    }
+    val live = liveInvitationText(rendered.text, if (draft.textEdited) draft.invitationText else null, editedFrom)
+    val shownText = live.text
     val uiLang = if (arabic) "ar" else "en"
 
     fun requestClose() {
@@ -331,9 +339,9 @@ fun EventEditorDialog(
                             FilterChip(
                                 selected = draft.type == type,
                                 onClick = {
-                                    val followTemplate = draft.templateId == defaultTemplateFor(draft.type) || draft.templateId.isBlank()
+                                    val followTemplate = draft.templateId.isBlank() || template.id == defaultTemplateId(defaultTemplateFor(draft.type), draft.language)
                                     var next = draft.copy(type = type)
-                                    if (followTemplate) next = next.copy(templateId = defaultTemplateFor(type))
+                                    if (followTemplate) next = next.copy(templateId = defaultTemplateId(defaultTemplateFor(type), draft.language))
                                     if (type == EventTypes.PRAYER && next.prayer.isBlank()) next = next.copy(prayer = Prayers.FAJR)
                                     if (type == EventTypes.PRAYER && (next.title.isBlank() || next.title == defaultPrayerTitle(draft.prayer, draft.language))) {
                                         next = next.copy(title = defaultPrayerTitle(next.prayer, next.language))
@@ -529,6 +537,15 @@ fun EventEditorDialog(
                             )
                         }
                     }
+                    if (resolved.fallback) {
+                        Text(
+                            if (arabic) "قالب هذه المناسبة لم يعد موجودًا؛ يُستخدم بدلًا منه «${template.name}». المناسبة لم تتغير حتى تحفظها."
+                            else "This event's template no longer exists; \"${template.name}\" is used instead. The event is unchanged until you save it.",
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
                     if (rendered.unknownVariables.isNotEmpty()) {
                         Text(
                             (if (arabic) "متغيرات غير معروفة في القالب لم تُستخدم: " else "Unknown template variables were left out: ") +
@@ -541,21 +558,34 @@ fun EventEditorDialog(
                     Spacer(Modifier.height(10.dp))
                     OutlinedTextField(
                         value = shownText,
-                        onValueChange = { draft = draft.copy(invitationText = it, textEdited = true) },
+                        onValueChange = {
+                            if (!draft.textEdited) editedFrom = rendered.text
+                            draft = draft.copy(invitationText = it, textEdited = true)
+                        },
                         label = { Text(if (arabic) "نص الدعوة (قابل للتعديل)" else "Invitation text (editable)") },
                         modifier = Modifier.fillMaxWidth(),
                         // each line takes its direction from its own text (Arabic invitation inside an English UI and vice versa)
                         textStyle = LocalTextStyle.current.copy(textDirection = TextDirection.Content),
                         minLines = 6
                     )
-                    if (draft.textEdited) {
-                        Text(
-                            if (arabic) "عدّلت النص يدويًا؛ لن يتغير تلقائيًا عند تغيير الحقول." else "You edited the text; it no longer follows field changes automatically.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.secondary
-                        )
-                        TextButton(onClick = { draft = draft.copy(textEdited = false, invitationText = "") }) {
-                            Text(if (arabic) "إعادة النص من القالب" else "Reset text from template")
+                    if (live.manual) {
+                        if (live.stale) {
+                            Text(
+                                if (arabic) "تغيّرت القيم (الوقت أو الإقامة أو التاريخ أو التنويهات أو القالب) بعد تعديلك اليدوي؛ النص أعلاه لا يحتوي القيم الجديدة."
+                                else "Values (time, iqama, date, notices or template) changed after your manual edit; the text above does not contain the new values.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        } else {
+                            Text(
+                                if (arabic) "عدّلت النص يدويًا؛ لن يتغير تلقائيًا عند تغيير الحقول." else "You edited the text; it no longer follows field changes automatically.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.secondary
+                            )
+                        }
+                        TextButton(onClick = { confirmUpdateText = true }) {
+                            Text(if (arabic) "تحديث النص بأحدث القيم" else "Update text with latest values")
                         }
                     }
 
@@ -613,6 +643,20 @@ fun EventEditorDialog(
                 }
             },
             dismissButton = { OutlinedButton(onClick = { pendingTemplateId = null }) { Text(if (arabic) "إلغاء" else "Cancel") } }
+        )
+    }
+
+    if (confirmUpdateText) {
+        AlertDialog(
+            onDismissRequest = { confirmUpdateText = false },
+            title = { Text(if (arabic) "تحديث النص بأحدث القيم؟" else "Update text with latest values?") },
+            text = { Text(if (arabic) "سيُستبدل نصك المعدّل يدويًا بنص القالب «${template.name}» مع القيم الحالية. تعديلاتك اليدوية ستُفقد." else "Your hand-edited text is replaced by the \"${template.name}\" template text with the current values. Your manual edits will be lost.") },
+            confirmButton = {
+                Button(onClick = { draft = draft.copy(textEdited = false, invitationText = ""); confirmUpdateText = false }) {
+                    Text(if (arabic) "تحديث النص" else "Update text")
+                }
+            },
+            dismissButton = { OutlinedButton(onClick = { confirmUpdateText = false }) { Text(if (arabic) "إلغاء" else "Cancel") } }
         )
     }
 
@@ -805,21 +849,20 @@ fun InvitationPreviewDialog(
     var showPhotoPicker by rememberSaveable(event.id) { mutableStateOf(false) }
 
     val times = ShareTimes(sessionTime, sessionOpening, sessionDate, sessionIqama, sessionShowDate, sessionNotes, sessionTemplateId)
-    val templateOptions = templateChoices(customTemplates, event.language, arabic)
-    val templateBody = templateOptions.firstOrNull { it.id == event.templateId }?.body
-    val sessionTemplateBody = templateOptions.firstOrNull { it.id == sessionTemplateId }?.body
-    val shareTextResult =
-        if (forceTemplate && sessionTemplateBody != null) ShareText(renderEvent(times.sessionEvent(event), sessionTemplateBody).text, ShareTextSource.TEMPLATE)
-        else shareInvitationText(event, times, templateBody, sessionTemplateBody)
-    val generatedText = shareTextResult.text
+    val templateOptions = templateChoices(customTemplates, event.language)
+    // the stored template chosen for this share (the event's own one at first); a missing one falls back to the type's default
+    val sessionTemplate = resolveEventTemplate(customTemplates, sessionTemplateId, event.language, event.type)
+    val shareTextResult = shareInvitationText(event, times, sessionTemplate.template.body, regenerate = forceTemplate)
+    // what the template gives right now for the session values (the preview follows it unless the text was edited by hand)
+    val freshText = renderEvent(times.sessionEvent(event), sessionTemplate.template.body).text
     // the text shown in the preview is exactly the text copied / shared
-    val text = finalTextEdit ?: generatedText
-    // the user edited the final text, then changed a value: the edit does not contain that change
-    val editStale = finalTextEdit != null && editedBase != generatedText
+    val text = finalTextEdit ?: shareTextResult.text
+    // a manual text (edited here, or saved hand-edited) is kept; it is out of date once a value changed after the edit
+    val editStale = if (finalTextEdit != null) editedBase != freshText else shareTextResult.valuesDiffer
     val timesChanged = times != savedTimes(event) || finalTextEdit != null || forceTemplate
 
     fun chooseTemplate(id: String) {
-        if (id == sessionTemplateId) return
+        if (id == sessionTemplate.template.id) return
         // never replace a hand-edited text silently
         if (finalTextEdit != null || (event.textEdited && !forceTemplate)) pendingTemplateId = id
         else { sessionTemplateId = id; finalTextEdit = null }
@@ -840,8 +883,9 @@ fun InvitationPreviewDialog(
     val qrToShare = includeQr && qrLink != null
 
     fun regenerate(e: ShareEvent): ShareEvent? {
-        val choice = templateChoices(customTemplates, e.language, arabic).firstOrNull { it.id == e.templateId } ?: return null
-        return e.copy(invitationText = renderEvent(e, choice.body).text, textEdited = false, updatedAt = System.currentTimeMillis())
+        val resolved = resolveEventTemplate(customTemplates, e.templateId, e.language, e.type)
+        if (resolved.fallback) return null
+        return e.copy(templateId = resolved.template.id, invitationText = renderEvent(e, resolved.template.body).text, textEdited = false, updatedAt = System.currentTimeMillis())
     }
 
     /**
@@ -853,7 +897,8 @@ fun InvitationPreviewDialog(
         val now = System.currentTimeMillis()
         var updated = event
         val saveTimes = updateEventTimes && timesChanged
-        if (saveTimes) updated = applyShareTimes(updated, times, shareTextResult, now, finalText = text)
+        // the template actually used is saved by its stored id (an old built-in id or a missing template is not kept)
+        if (saveTimes) updated = applyShareTimes(updated, times, shareTextResult, now, finalText = text).copy(templateId = sessionTemplate.template.id)
         if (sharedPhoto != null && sharedPhoto != event.invitationPhoto) updated = updated.copy(invitationPhoto = sharedPhoto, updatedAt = now)
         if (updated == event) return
         onUpdateEvent(updated)
@@ -957,8 +1002,17 @@ fun InvitationPreviewDialog(
                         Text(if (arabic) "القالب" else "Template", style = MaterialTheme.typography.bodySmall)
                         LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             items(templateOptions, key = { it.id }) { c ->
-                                FilterChip(selected = sessionTemplateId == c.id, onClick = { chooseTemplate(c.id) }, label = { Text(c.name) })
+                                FilterChip(selected = sessionTemplate.template.id == c.id, onClick = { chooseTemplate(c.id) }, label = { Text(c.name) })
                             }
+                        }
+                        if (sessionTemplate.fallback) {
+                            Text(
+                                if (arabic) "قالب هذه المناسبة لم يعد موجودًا؛ يُستخدم بدلًا منه «${sessionTemplate.template.name}»."
+                                else "This event's template no longer exists; \"${sessionTemplate.template.name}\" is used instead.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error,
+                                fontWeight = FontWeight.SemiBold
+                            )
                         }
                         if (timesChanged) {
                             Text(
@@ -980,28 +1034,6 @@ fun InvitationPreviewDialog(
                             }) {
                                 Text(if (arabic) "الرجوع للقيم المحفوظة" else "Back to saved values")
                             }
-                        }
-                        when (shareTextResult.source) {
-                            ShareTextSource.TIMES_REPLACED -> Text(
-                                if (arabic) "نصك معدّل يدويًا؛ استُبدل التاريخ/الوقت فيه لهذه المشاركة فقط." else "Your text is hand-edited; the date/time in it was replaced for this share only.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.secondary
-                            )
-                            ShareTextSource.TIMES_NOT_APPLIED -> if (finalTextEdit == null) {
-                                Text(
-                                    if (arabic) "نصك معدّل يدويًا ولا يمكن وضع القيم الجديدة فيه بأمان؛ النص أدناه لم يتغير. عدّله أدناه لهذه المشاركة، أو أعد توليده من القالب."
-                                    else "Your text is hand-edited and the new values cannot be placed in it safely; the text below did not change. Edit it below for this share, or rebuild it from the template.",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.error,
-                                    fontWeight = FontWeight.SemiBold
-                                )
-                                if (sessionTemplateBody != null) {
-                                    TextButton(onClick = { confirmForceTemplate = true }) {
-                                        Text(if (arabic) "توليد النص من القالب لهذه المشاركة" else "Rebuild from the template for this share")
-                                    }
-                                }
-                            }
-                            else -> {}
                         }
                     }
                 }
@@ -1079,7 +1111,7 @@ fun InvitationPreviewDialog(
                     OutlinedTextField(
                         value = text,
                         onValueChange = {
-                            if (finalTextEdit == null) editedBase = generatedText
+                            if (finalTextEdit == null) editedBase = freshText
                             finalTextEdit = it
                         },
                         modifier = Modifier.fillMaxWidth().padding(6.dp),
@@ -1092,18 +1124,26 @@ fun InvitationPreviewDialog(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                if (finalTextEdit != null) {
+                // a manual text is never overwritten by a value change: warn, and update it only on an explicit, confirmed action
+                val manualText = finalTextEdit != null || shareTextResult.source == ShareTextSource.MANUAL_KEPT
+                if (manualText) {
                     if (editStale) {
                         Text(
-                            if (arabic) "عدّلت النص يدويًا ثم غيّرت قيمًا أخرى؛ هذه التغييرات ليست في نصك. عدّله يدويًا أو أعد توليده (يستبدل تعديلاتك)."
-                            else "You edited the text, then changed other values; those changes are not in your text. Edit it, or rebuild it (replaces your edits).",
+                            if (arabic) "تغيّرت القيم (الوقت أو الإقامة أو فتح الباب أو التاريخ أو التنويهات أو القالب) بعد تعديل النص يدويًا؛ النص أعلاه لا يحتوي القيم الجديدة."
+                            else "Values (time, iqama, doors open, date, notices or template) changed after the text was edited by hand; the text above does not contain the new values.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.error,
                             fontWeight = FontWeight.SemiBold
                         )
+                    } else {
+                        Text(
+                            if (arabic) "النص معدّل يدويًا؛ لا يتغير تلقائيًا عند تغيير القيم." else "The text is edited by hand; it does not change automatically when values change.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.secondary
+                        )
                     }
                     TextButton(onClick = { confirmForceTemplate = true }) {
-                        Text(if (arabic) "إعادة توليد النص (يستبدل تعديلاتك)" else "Rebuild the text (replaces your edits)")
+                        Text(if (arabic) "تحديث النص بأحدث القيم" else "Update text with latest values")
                     }
                 }
 
@@ -1175,7 +1215,8 @@ fun InvitationPreviewDialog(
             onDismissRequest = { pendingTemplateId = null },
             title = { Text(if (arabic) "استبدال النص؟" else "Replace the text?") },
             text = { Text(if (arabic) "نص الدعوة معدّل يدويًا. تطبيق قالب آخر يستبدل النص في هذه المشاركة." else "The invitation text was edited by hand. Using another template replaces the text in this share.") },
-            confirmButton = { Button(onClick = { sessionTemplateId = id; finalTextEdit = null; forceTemplate = false; pendingTemplateId = null }) { Text(if (arabic) "استبدال" else "Replace") } },
+            // confirmed: the text of this share now comes from the chosen template (the manual text is replaced)
+            confirmButton = { Button(onClick = { sessionTemplateId = id; finalTextEdit = null; forceTemplate = true; pendingTemplateId = null }) { Text(if (arabic) "استبدال" else "Replace") } },
             dismissButton = { OutlinedButton(onClick = { pendingTemplateId = null }) { Text(if (arabic) "إلغاء" else "Cancel") } }
         )
     }
@@ -1183,9 +1224,9 @@ fun InvitationPreviewDialog(
     if (confirmForceTemplate) {
         AlertDialog(
             onDismissRequest = { confirmForceTemplate = false },
-            title = { Text(if (arabic) "إعادة توليد النص؟" else "Rebuild the text?") },
-            text = { Text(if (arabic) "سيُستبدل النص الحالي بنص القالب مع قيم هذه المشاركة." else "The current text is replaced by the template text with this share's values.") },
-            confirmButton = { Button(onClick = { forceTemplate = true; finalTextEdit = null; confirmForceTemplate = false }) { Text(if (arabic) "استبدال" else "Replace") } },
+            title = { Text(if (arabic) "تحديث النص بأحدث القيم؟" else "Update text with latest values?") },
+            text = { Text(if (arabic) "سيُستبدل النص المعدّل يدويًا بنص القالب «${sessionTemplate.template.name}» مع قيم هذه المشاركة. تعديلاتك اليدوية ستُفقد." else "The hand-edited text is replaced by the \"${sessionTemplate.template.name}\" template text with this share's values. Your manual edits will be lost.") },
+            confirmButton = { Button(onClick = { forceTemplate = true; finalTextEdit = null; confirmForceTemplate = false }) { Text(if (arabic) "تحديث النص" else "Update text") } },
             dismissButton = { OutlinedButton(onClick = { confirmForceTemplate = false }) { Text(if (arabic) "إلغاء" else "Cancel") } }
         )
     }
@@ -1332,11 +1373,15 @@ private val TEMPLATE_TYPES = EventTypes.all + PLACE_TEMPLATE_TYPE
 @Composable
 fun TemplateManagerDialog(
     arabic: Boolean,
-    customTemplates: List<InvitationTemplate>,
+    /** all stored templates: the seeded defaults and the user's own */
+    templates: List<InvitationTemplate>,
     onSaveTemplate: (InvitationTemplate) -> Unit,
     onDeleteTemplate: (InvitationTemplate) -> Unit,
     onClose: () -> Unit
 ) {
+    val ordered = orderedTemplates(templates)
+    val defaultTemplates = ordered.filter { isDefaultTemplate(it.id) }
+    val customTemplates = ordered.filterNot { isDefaultTemplate(it.id) }
     var editing by remember { mutableStateOf<InvitationTemplate?>(null) }
     var preview by remember { mutableStateOf<Triple<String, String, String>?>(null) } // name, body, type
     var deleting by remember { mutableStateOf<InvitationTemplate?>(null) }
@@ -1362,25 +1407,26 @@ fun TemplateManagerDialog(
                         }
                     }
                     Text(
-                        if (arabic) "يبدأ القالب الجديد فارغًا، أو انسخ قالبًا مدمجًا وعدّله." else "A new template starts empty, or copy a built-in template and edit it.",
+                        if (arabic) "القوالب الافتراضية تُعدَّل مباشرة، والمناسبات الجديدة تستخدمها كما حفظتها. يمكنك أيضًا إنشاء قالب جديد أو نسخ قالب."
+                        else "Default templates are edited directly, and new events use them as you saved them. You can also create a new template or copy one.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Spacer(Modifier.height(6.dp))
-                    Text(if (arabic) "القوالب المدمجة" else "Built-in templates", fontWeight = FontWeight.Bold)
+                    Text(if (arabic) "القوالب الافتراضية" else "Default templates", fontWeight = FontWeight.Bold)
                 }
-                items(BUILT_IN_TEMPLATES + BUILT_IN_PLACE_TEMPLATES) { t ->
-                    val name = if (arabic) t.nameAr else t.nameEn
-                    val body = if (arabic) t.bodyAr else t.bodyEn
+                // the stored defaults: edited in place (no copy needed); kept, so they cannot be deleted
+                items(defaultTemplates, key = { it.id }) { t ->
                     Card(shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth()) {
                         Column(modifier = Modifier.padding(12.dp)) {
-                            Text(name, fontWeight = FontWeight.SemiBold)
-                            Text(eventTypeLabel(t.type, arabic), style = MaterialTheme.typography.bodySmall)
+                            Text(t.name.ifBlank { if (arabic) "بدون اسم" else "Untitled" }, fontWeight = FontWeight.SemiBold)
+                            Text(eventTypeLabel(t.type, arabic) + " — " + (if (t.language == "en") "EN" else "عربي"), style = MaterialTheme.typography.bodySmall)
                             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                TextButton(onClick = { preview = Triple(name, body, t.type) }) { Text(if (arabic) "معاينة" else "Preview") }
-                                TextButton(onClick = {
-                                    editing = newTemplate(t.type, name + if (arabic) " (نسخة)" else " (copy)", body)
-                                }) { Text(if (arabic) "نسخ للتعديل" else "Copy to edit") }
+                                TextButton(onClick = { preview = Triple(t.name, t.body, t.type) }) { Text(if (arabic) "معاينة" else "Preview") }
+                                TextButton(onClick = { editing = t }) { Text(if (arabic) "تعديل" else "Edit") }
+                                TextButton(onClick = { editing = newTemplate(t.type, t.name + if (arabic) " (نسخة)" else " (copy)", t.body, t.language) }) {
+                                    Text(if (arabic) "نسخ" else "Copy")
+                                }
                             }
                         }
                     }
@@ -1429,7 +1475,7 @@ fun TemplateManagerDialog(
         AlertDialog(
             onDismissRequest = { deleting = null },
             title = { Text(if (arabic) "حذف القالب؟" else "Delete template?") },
-            text = { Text(if (arabic) "المناسبات المحفوظة تحتفظ بنص دعوتها كما هو." else "Saved events keep their invitation text as it is.") },
+            text = { Text(if (arabic) "المناسبات التي تستخدمه ستستخدم القالب الافتراضي لنوعها (مع تنبيه)، والنصوص المعدّلة يدويًا تبقى كما هي." else "Events that use it will use the default template of their type (with a notice); hand-edited texts stay as they are.") },
             confirmButton = { Button(onClick = { onDeleteTemplate(t); deleting = null }) { Text(if (arabic) "حذف" else "Delete") } },
             dismissButton = { OutlinedButton(onClick = { deleting = null }) { Text(if (arabic) "إلغاء" else "Cancel") } }
         )
@@ -1437,7 +1483,7 @@ fun TemplateManagerDialog(
 }
 
 /**
- * Editing a template never changes a saved invitation: events keep their saved text until it is rebuilt on purpose.
+ * Editing a template never rewrites a hand-edited invitation; invitations generated from the template follow it.
  * Fields are inserted at the cursor from a menu of readable names; the "{name}" form is shown only as a hint.
  */
 @Composable
@@ -1448,6 +1494,8 @@ private fun TemplateEditorDialog(arabic: Boolean, initial: InvitationTemplate, o
     var body by rememberSaveable(stateSaver = TextFieldValue.Saver) { mutableStateOf(TextFieldValue(initial.body)) }
     var error by rememberSaveable { mutableStateOf("") }
     var showFields by remember { mutableStateOf(false) }
+    // a default template keeps its type and language: events and place shares find it by them
+    val fixedTypeAndLanguage = isDefaultTemplate(initial.id)
     // the type row starts scrolled to the template's own type, so the current choice is always visible
     val typeRowState = rememberLazyListState(initialFirstVisibleItemIndex = TEMPLATE_TYPES.indexOf(initial.type).coerceAtLeast(0))
     val known = variablesFor(type)
@@ -1471,11 +1519,19 @@ private fun TemplateEditorDialog(arabic: Boolean, initial: InvitationTemplate, o
                     OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text(if (arabic) "اسم القالب" else "Template name") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
                     Spacer(Modifier.height(8.dp))
                     Text(if (arabic) "نوع القالب" else "Template type", style = MaterialTheme.typography.bodySmall)
-                    LazyRow(state = typeRowState, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        items(TEMPLATE_TYPES) { t -> FilterChip(selected = type == t, onClick = { type = t }, label = { Text(eventTypeLabel(t, arabic)) }) }
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        listOf("ar" to "عربي", "en" to "English").forEach { (l, label) -> FilterChip(selected = language == l, onClick = { language = l }, label = { Text(label) }) }
+                    if (fixedTypeAndLanguage) {
+                        Text(
+                            eventTypeLabel(type, arabic) + " — " + (if (language == "en") "English" else "عربي") +
+                                if (arabic) " (قالب افتراضي)" else " (default template)",
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    } else {
+                        LazyRow(state = typeRowState, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            items(TEMPLATE_TYPES) { t -> FilterChip(selected = type == t, onClick = { type = t }, label = { Text(eventTypeLabel(t, arabic)) }) }
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            listOf("ar" to "عربي", "en" to "English").forEach { (l, label) -> FilterChip(selected = language == l, onClick = { language = l }, label = { Text(label) }) }
+                        }
                     }
                     Spacer(Modifier.height(8.dp))
                     OutlinedTextField(

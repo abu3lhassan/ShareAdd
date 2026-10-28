@@ -6,6 +6,7 @@ import com.example.shareadd.assignPlaceIds
 import com.example.shareadd.categoryFromLegacy
 import com.example.shareadd.detectImageExtension
 import com.example.shareadd.events.InvitationTemplate
+import com.example.shareadd.events.isDefaultTemplate
 import com.example.shareadd.events.ShareEvent
 import com.example.shareadd.events.readEvent
 import com.example.shareadd.events.readTemplate
@@ -764,6 +765,12 @@ fun planImport(
                 val ids = currentCustom.map { it.id }.toHashSet()
                 val result = currentCustom.toMutableList()
                 fileTemplates.forEach { t ->
+                    // a default template the device already has with the same content is not added again as a copy
+                    val existing = if (isDefaultTemplate(t.id)) currentCustom.firstOrNull { it.id == t.id } else null
+                    if (existing != null && existing.name == t.name && existing.type == t.type && existing.language == t.language && existing.body == t.body) {
+                        templatesSkipped++
+                        return@forEach
+                    }
                     templatesAdded++
                     if (ids.add(t.id)) result.add(t) else { var f = newTemplateIdFn(); while (!ids.add(f)) f = newTemplateIdFn(); result.add(t.copy(id = f)) }
                 }
