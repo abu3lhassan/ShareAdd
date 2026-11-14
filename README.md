@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="Download/ShareAdd-v1.2.1-release.apk">Download APK</a>
+  <a href="https://github.com/abu3lhassan/ShareAdd/releases/latest">Download</a>
   &nbsp;·&nbsp;
   <a href="#features">Features</a>
   &nbsp;·&nbsp;
@@ -72,13 +72,9 @@ It was designed and built by one developer as an independent project, with a ful
 
 ## Install
 
-1. Download the APK: [ShareAdd-v1.2.1-release.apk](Download/ShareAdd-v1.2.1-release.apk) (version 1.2.1, about 8 MB).
+1. Download the latest APK from the [Releases](https://github.com/abu3lhassan/ShareAdd/releases/latest) page.
 2. Open it on your Android phone and allow installation from your browser or file manager when Android asks.
-3. To confirm the file, compare its SHA-256 checksum with the one below.
-
-```
-SHA-256  3221c3757205cb4a3c1446a45c2ba330dc5b9dd14fe4f644d0affd05bba61493
-```
+3. To confirm the file, compare its SHA-256 checksum with the one in the release notes.
 
 The APK is signed with the developer's release key. Its certificate fingerprint is:
 
